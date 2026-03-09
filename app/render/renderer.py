@@ -3,10 +3,7 @@
 from __future__ import annotations
 import os
 import re
-import logging
 from typing import Dict, List, Tuple
-
-logger = logging.getLogger(__name__)
 
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageStat
@@ -226,66 +223,15 @@ def render_translations(
                         best_lines = test_lines
                         best_height = test_height
                         break
-            
-            # Efficient width overflow check (runs once, not in every loop)
-            # If any line is wider than the box, shrink font until it fits
-            max_line_width = max((draw.textlength(line, font=best_font) for line in best_lines), default=0)
-            if max_line_width > w * 1.05:  # 5% tolerance
-                current_size = best_font.size if hasattr(best_font, 'size') else 12
-                for shrink_size in range(current_size - 1, 9, -1):
-                    shrink_font = _load_font(_find_font_path(region_font), shrink_size, _sample_char(text))
-                    shrink_lines = _wrap_text(draw, text, shrink_font, w)
-                    shrink_max_w = max((draw.textlength(ln, font=shrink_font) for ln in shrink_lines), default=0)
-                    if shrink_max_w <= w * 1.05:
-                        best_font = shrink_font
-                        best_lines = shrink_lines
-                        break
-            
-            if forced_color:
-                fill_color = forced_color
-            else:
-                fill_color = _resolve_text_color(working, box)
-            
-            # Use font metrics for reliable line spacing
-            ascent, descent = best_font.getmetrics()
-            line_spacing = ascent + descent
-            
-            # Standard Metric Centering for Vertical Alignment (Stable for Line Spacing)
-            total_text_height = len(best_lines) * line_spacing
-            
-            # Center the block vertically in the box
-            # start_y corresponds to the top of the first line's ascender/em-box
-            start_y = y0 + (h - total_text_height) // 2
-            
-            # Draw lines
-            for i, line in enumerate(best_lines):
-                if not line.strip():
-                    continue
-                    
-                # Use Visual (Ink) Width for Horizontal Centering
-                # This ensures characters with off-center glyphs (like punctuation) look centered
-                line_bbox = best_font.getbbox(line)
-                line_width = line_bbox[2] - line_bbox[0]
-                
-                # Center horizontally based on visual width
-                start_x = x0 + (w - line_width) // 2
-                
-                # Draw Y for this line.
-                # We use anchor='ls' (Left Baseline) to ensure proper baseline alignment
-                # for mixed fonts (e.g. CJK + Latin).
-                # The 'draw_y' calculated previously was for the Top-Left (Ascender).
-                # To get the baseline, we add the ascent.
-                baseline_y = start_y + i * line_spacing + ascent
-                
-                # Align X using ink-left (bbox[0]) to shift the visual start to start_x
-                draw_x = start_x - line_bbox[0]
-                
-                try:
-                    draw.text((draw_x, baseline_y), line, fill=fill_color, font=best_font, anchor="ls")
-                except ValueError:
-                    # Fallback for older Pillow versions without anchor support
-                    # Assuming default anchor is 'la' (Left Ascender)
-                    draw.text((draw_x, baseline_y - ascent), line, fill=fill_color, font=best_font)
+            offset_y = y0 + max(0, (h - best_height) // 2)
+            fill_color = forced_color or _resolve_text_color(working, box)
+            for line in best_lines:
+                bbox = best_font.getbbox(line)
+                line_width = bbox[2] - bbox[0]
+                line_height = bbox[3] - bbox[1]
+                offset_x = x0 + max(0, (w - line_width) // 2) - bbox[0]
+                draw.text((offset_x, offset_y - bbox[1]), line, fill=fill_color, font=best_font)
+                offset_y += line_height
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         # Save with high quality to prevent JPEG compression artifacts
         ext = os.path.splitext(output_path)[1].lower()
@@ -301,34 +247,33 @@ def _apply_text_removal(image, text_mask, mode: str, use_gpu: bool, model_id: st
     mode = (mode or "fast").lower()
     
     if cv2 is None or np is None:
-        logger.warning("[TextRemoval] No CV2/numpy, using simple white mask") 
+        print("[TextRemoval] No CV2/numpy, using simple white mask")
         return _apply_white_mask(image, text_mask)
     
     # Always try white bubble fill first (cleanest option)
     bubble_fill = _white_bubble_fill(image, text_mask)
     if bubble_fill is not None:
-        logger.info("[TextRemoval] Used WHITE BUBBLE FILL")
+        print("[TextRemoval] Used WHITE BUBBLE FILL")
         return bubble_fill
     
     # Try uniform fill for simple backgrounds (handles most cases)
     uniform_fill = _apply_uniform_fill(image, text_mask)
     if uniform_fill is not None:
-        logger.info("[TextRemoval] Used UNIFORM FILL")
+        print("[TextRemoval] Used UNIFORM FILL")
         return uniform_fill
     
     # For remaining complex areas: use AI inpainting if enabled, otherwise CV2
     if mode == "ai" and use_gpu:
         try:
-            logger.info(f"[TextRemoval] Using AI INPAINT with model: {model_id}")
+            print(f"[TextRemoval] Using AI INPAINT with model: {model_id}")
             from app.render.inpaint_ai import ai_inpaint
             result = ai_inpaint(image, text_mask, use_gpu=use_gpu, model_id=model_id)
-            logger.info("[TextRemoval] AI INPAINT Success")
+            print("[TextRemoval] AI INPAINT Success")
             return result
         except Exception as e:
-            logger.warning(f"[TextRemoval] AI INPAINT failed: {e}, falling back to CV2")
-            pass
+            print(f"[TextRemoval] AI INPAINT failed: {e}, falling back to CV2")
     
-    logger.info("[TextRemoval] Used CV2 INPAINT (fallback)")
+    print("[TextRemoval] Used CV2 INPAINT (fallback)")
     # CV2 inpainting with moderate dilation for complex areas
     img_np = np.array(image)
     kernel_size = max(5, int(max(text_mask.shape) * 0.004))
@@ -598,23 +543,6 @@ def _apply_bubble_fill(image, bubble_mask, text_mask, reference_np):
 def _apply_white_mask(image, text_mask):
     if cv2 is None or np is None:
         draw = ImageDraw.Draw(image)
-        try:
-            h = len(text_mask)
-            w = len(text_mask[0]) if h else 0
-        except Exception:
-            return image
-        if h <= 0 or w <= 0:
-            return image
-        # PIL-only fallback: fill every masked pixel so text is removed even without cv2/numpy.
-        px = image.load()
-        for y in range(min(h, image.height)):
-            row = text_mask[y]
-            for x in range(min(w, image.width)):
-                try:
-                    if int(row[x]) > 0:
-                        px[x, y] = (255, 255, 255)
-                except Exception:
-                    continue
         return image
     img_np = np.array(image)
     # Aggressively dilate mask to ensure complete text coverage
@@ -920,7 +848,9 @@ def _wrap_text(draw, text: str, font, max_width: int, max_lines: int | None = No
     has_space = " " in text
     for idx, ch in enumerate(words):
         candidate = (current + " " + ch).strip() if has_space else current + ch
-        # Removed forced punct merge (lines 887-889) to allow wrapping if width exceeded
+        if _is_punct_only(ch) and current:
+            current = f"{current}{ch}"
+            continue
         if draw.textlength(candidate, font=font) <= max_width or not current:
             current = candidate
         else:
@@ -933,7 +863,7 @@ def _wrap_text(draw, text: str, font, max_width: int, max_lines: int | None = No
                 break
     if current:
         lines.append(current)
-    # lines = _fix_leading_punct(lines)  <-- Removed to allow vertical stacking of punctuation in narrow bubbles
+    lines = _fix_leading_punct(lines)
     return lines
 
 
@@ -995,8 +925,10 @@ def _tokenize_text(text: str) -> List[str]:
             tokens.append(text[index:end])
             index = end
             continue
-        # Removed forced punct merge to allow separate tokens for wrapping
-        tokens.append(ch)
+        if _is_punct_char(ch) and tokens:
+            tokens[-1] = f"{tokens[-1]}{ch}"
+        else:
+            tokens.append(ch)
         index += 1
     return tokens
 
