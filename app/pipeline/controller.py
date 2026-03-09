@@ -32,6 +32,10 @@ class PipelineStatus(QtCore.QObject):
     page_time_changed = QtCore.Signal(str)
     page_ready = QtCore.Signal(int, dict)
     consistency_issue = QtCore.Signal(list)  # Pages needing glossary update
+    # Two-Pass Pipeline signals
+    prescan_started = QtCore.Signal()
+    prescan_progress = QtCore.Signal(int)
+    prescan_finished = QtCore.Signal()
 
 
 @dataclass
@@ -74,6 +78,8 @@ class PipelineSettings:
     files_whitelist: List[str] | None = None
     discovery_model: str | None = None # Model to use for discovery (None=Auto)
     discovery_backend: str = "Ollama" # "Ollama" or "GGUF"
+    prescan_enabled: bool = False  # Run pre-scan to build glossary before translation
+    debug_ocr: bool = False  # Save OCR crop images for debugging
 
 
 class PipelineWorker(QtCore.QThread):
@@ -87,6 +93,10 @@ class PipelineWorker(QtCore.QThread):
     page_time_changed = QtCore.Signal(str)
     page_ready = QtCore.Signal(int, dict)
     consistency_issue = QtCore.Signal(list)
+    # Two-Pass Pipeline signals
+    prescan_started = QtCore.Signal()
+    prescan_progress = QtCore.Signal(int)
+    prescan_finished = QtCore.Signal()
 
     def __init__(self, settings: PipelineSettings, parent=None) -> None:
         super().__init__(parent)
@@ -205,9 +215,14 @@ class PipelineWorker(QtCore.QThread):
                 if self._settings.translator_backend == "GGUF":
                     from app.translate.gguf_client import GGUFClient
                     n_gpu_layers = self._settings.gguf_n_gpu_layers if self._settings.use_gpu else 0
+                    # Auto-detect prompt style from filename if generic settings used
+                    prompt_style = self._settings.gguf_prompt_style
+                    if "sakura" in self._settings.gguf_model_path.lower() and prompt_style == "qwen":
+                        prompt_style = "sakura"
+                        
                     ollama = GGUFClient(
                         model_path=self._settings.gguf_model_path,
-                        prompt_style=self._settings.gguf_prompt_style,
+                        prompt_style=prompt_style,
                         n_ctx=self._settings.gguf_n_ctx,
                         n_gpu_layers=n_gpu_layers,
                         n_threads=self._settings.gguf_n_threads,
@@ -226,6 +241,11 @@ class PipelineWorker(QtCore.QThread):
             except Exception as exc:
                 self.message.emit(_friendly_model_error(exc))
                 return
+            model_name = (
+                self._settings.gguf_model_path
+                if self._settings.translator_backend == "GGUF"
+                else self._settings.ollama_model
+            )
             resolved_model = _resolve_model(self._settings.ollama_model)
             if self._settings.translator_backend == "Ollama":
                 if resolved_model and self._settings.ollama_model != "auto-detect":
@@ -236,6 +256,12 @@ class PipelineWorker(QtCore.QThread):
             elif not self._settings.gguf_model_path:
                 self.message.emit("GGUF model path is required for GGUF backend.")
                 return
+            
+            # Ensure model name is set on the client for glossary translation
+            if hasattr(ollama, "translate_glossary"):
+                 # Use resolved model for Ollama, or path for GGUF (though GGUF uses internal path)
+                 setattr(ollama, "model_name", resolved_model or model_name)
+
             if self._settings.auto_glossary and not self._settings.style_guide_path:
                 self._settings.style_guide_path = os.path.join(self._settings.export_dir, "style_guide.json")
             style_guide = _load_style_guide(self._settings.style_guide_path)
@@ -259,14 +285,39 @@ class PipelineWorker(QtCore.QThread):
             else:
                 project["project"]["model"]["translator"] = f"ollama:{self._settings.ollama_model}"
             project["project"]["style_guide"] = self._settings.style_guide_path or ""
-            model_name = (
-                self._settings.gguf_model_path
-                if self._settings.translator_backend == "GGUF"
-                else self._settings.ollama_model
-            )
             auto_glossary_state = None
             if self._settings.auto_glossary:
                 auto_glossary_state = {"counts": {}, "map": {}}
+            
+            # Pre-Scan Mode: Build complete glossary before translation
+            if self._settings.prescan_enabled and self._settings.auto_glossary:
+                self.prescan_started.emit()
+                self.message.emit("Pre-Scan Mode: Building glossary before translation...")
+                try:
+                    from app.pipeline.prescan import prescan_for_glossary
+                    style_guide = prescan_for_glossary(
+                        import_dir=self._settings.import_dir,
+                        images=images,
+                        style_guide=style_guide,
+                        settings=self._settings,
+                        progress_callback=lambda p: self.prescan_progress.emit(p),
+                        message_callback=lambda m: self.message.emit(f"[Pre-Scan] {m}"),
+                        stop_check=lambda: self._stop_requested,
+                        translator=ollama,
+                        detector=detector,
+                        ocr_engine=ocr_engine,
+                    )
+                    # Save the updated style guide
+                    if self._settings.style_guide_path:
+                        from app.io.style_guide import save_style_guide
+                        save_style_guide(self._settings.style_guide_path, style_guide)
+                    self.message.emit(f"Pre-Scan complete: {len(style_guide.get('glossary', []))} glossary entries.")
+                except Exception as e:
+                    self.message.emit(f"Pre-Scan failed: {e}. Continuing with normal translation.")
+                    import logging
+                    logging.getLogger(__name__).exception("Pre-scan error")
+                finally:
+                    self.prescan_finished.emit()
             for index, name in enumerate(images, start=1):
                 if self._stop_requested:
                     self.message.emit("Stopped")
@@ -354,6 +405,24 @@ class PipelineWorker(QtCore.QThread):
                 remaining = avg * (total - index)
                 self.eta_changed.emit(_format_eta(remaining))
 
+                # --- PER-PAGE MEMORY CLEANUP ---
+                # Prevent memory accumulation over long chapters (fixes 2GB+ leak)
+                try:
+                    del regions
+                except NameError:
+                    pass
+                import gc
+                gc.collect()
+                
+                # Clear CUDA cache every 5 pages to balance speed vs memory
+                if self._settings.use_gpu and index % 5 == 0:
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+
             project["pages"] = pages
             json_path = self._settings.json_path or os.path.join(self._settings.export_dir, "project.json")
             try:
@@ -362,8 +431,6 @@ class PipelineWorker(QtCore.QThread):
                 self.message.emit("Failed to write project JSON.")
             
             # --- MEMORY CLEANUP START ---
-            # Explicitly cleanup heavy objects to prevent 14GB+ RAM accumulation over long chapters
-            del regions
             # Flush Python Garbage Collector
             import gc
             gc.collect()
@@ -454,36 +521,11 @@ class PipelineWorker(QtCore.QThread):
                                 auto_glossary_state,
                                 style_guide,
                                 self._settings.style_guide_path,
+                                bool(ollama and hasattr(ollama, "generate")),
                             )
                         if created_client is not None and hasattr(created_client, "close"):
                             try:
                                 created_client.close()
-                            except Exception:
-                                pass
-                    # Translate pending names from heuristic detection
-                    with _glossary_lock:
-                        pending_names = auto_glossary_state.get("pending_names", [])
-
-                    if pending_names:
-                        self.message.emit(f"Translating {len(pending_names)} detected names...")
-                        from app.translate.prompts import build_batch_translation_prompt
-
-                        # Use a simple translation prompt that Sakura can handle
-                        resolved_model = _resolve_model(model_name)
-                        for name in pending_names[:20]:  # Limit to avoid overload
-                            try:
-                                simple_prompt = f"将以下日语人名翻译成中文，只输出中文译名：\n{name}"
-                                translated = ollama.generate(
-                                    resolved_model,
-                                    simple_prompt,
-                                    timeout=60,
-                                    options={"num_predict": 50, "temperature": 0.1},
-                                )
-                                if translated and translated.strip():
-                                    clean_trans = _sanitize_glossary_target(translated.strip(), name, self._settings.target_lang)
-                                    if clean_trans and clean_trans != name:
-                                        with _glossary_lock:
-                                            auto_glossary_state.setdefault("map", {})[name] = clean_trans
                             except Exception:
                                 pass
 
@@ -512,6 +554,8 @@ class PipelineWorker(QtCore.QThread):
                 pass
             elif self._settings.files_whitelist:
                 self.message.emit("Skipping consistency check (re-translation mode).")
+            elif self._settings.prescan_enabled:
+                self.message.emit("Skipping consistency check (Pre-Scan enabled).")
             else:
                 try:
                     final_style = _load_style_guide(self._settings.style_guide_path)
@@ -565,6 +609,10 @@ class PipelineController(QtCore.QObject):
         self._worker.queue_item.connect(self.status.queue_item.emit)
         self._worker.page_ready.connect(self.status.page_ready.emit)
         self._worker.consistency_issue.connect(self.status.consistency_issue.emit)
+        # Two-Pass Pipeline signals
+        self._worker.prescan_started.connect(self.status.prescan_started.emit)
+        self._worker.prescan_progress.connect(self.status.prescan_progress.emit)
+        self._worker.prescan_finished.connect(self.status.prescan_finished.emit)
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
         self.status.message.emit("Started")
@@ -733,7 +781,7 @@ def _list_images(folder: str) -> List[str]:
         _, ext = os.path.splitext(entry)
         if ext.lower() in allowed:
             names.append(entry)
-    names.sort(key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split('(\d+)', s)])
+    names.sort(key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)])
     return names
 
 
@@ -791,10 +839,15 @@ def _friendly_model_error(exc: Exception) -> str:
             "comictextdetector.pt (GPU) from https://github.com/zyddnys/manga-image-translator/releases/tag/beta-0.2.1 "
             "and place it under models/comic-text-detector."
         )
-    if "gguf" in lowered or "llama-cpp-python" in lowered or "llama_cpp" in lowered:
+    if "llama-cpp-python is not installed" in lowered or "no module named 'llama_cpp'" in lowered:
         return (
-            "GGUF backend failed. Ensure llama-cpp-python is installed and the GGUF model path is valid."
+            "GGUF backend failed: llama-cpp-python is missing in the current environment. "
+            "Install it with: pip install llama-cpp-python, or switch Translator backend to Ollama."
         )
+    if "gguf model not found:" in lowered:
+        return f"GGUF backend failed: {text}"
+    if "gguf" in lowered or "llama-cpp-python" in lowered or "llama_cpp" in lowered:
+        return f"GGUF backend failed: {text}"
     if "yuzumarker" in lowered or "font detection" in lowered:
         return (
             "Font detection failed to initialize. Ensure the font model checkpoint is set and dependencies are installed."
@@ -848,6 +901,129 @@ def _load_style_guide(path: str):
     return default_style_guide()
 
 
+_paddle_fallback_instance = None
+_ocr_debug_counter = 0
+
+def _is_valid_japanese(text: str) -> float:
+    """
+    Score how likely text is valid Japanese (0.0 to 1.0).
+    Higher score = more valid Japanese characters.
+    """
+    if not text:
+        return 0.0
+    valid = 0
+    for c in text:
+        code = ord(c)
+        # Hiragana, Katakana, Kanji, punctuation
+        if (0x3040 <= code <= 0x30FF or  # Hiragana + Katakana
+            0x4E00 <= code <= 0x9FFF or  # Kanji
+            0x3000 <= code <= 0x303F or  # Japanese punctuation
+            c in '!?。、…・「」『』（）'):
+            valid += 1
+    return valid / len(text) if text else 0.0
+
+def _recognize_with_fallback(ocr_engine, crop, settings, bbox=None) -> tuple[str, float]:
+    """
+    OCR recognition using MangaOCR.
+    For wide boxes (impact text), compares MangaOCR and PaddleOCR results
+    and picks the one with more valid Japanese characters.
+    """
+    global _paddle_fallback_instance, _ocr_debug_counter
+    text = ""
+    conf = 1.0
+    
+    # Detect wide boxes (likely impact/title text)
+    is_wide_box = False
+    if bbox and len(bbox) >= 4:
+        x, y, w, h = bbox[:4]
+        if h > 0 and w > h * 2.5:  # Width > 2.5x height (stricter threshold)
+            is_wide_box = True
+    
+    # DEBUG: Save crop images
+    if settings and getattr(settings, 'debug_ocr', False):
+        try:
+            import os
+            debug_dir = os.path.join(settings.export_dir, "ocr_debug")
+            os.makedirs(debug_dir, exist_ok=True)
+            crop_path = os.path.join(debug_dir, f"crop_{_ocr_debug_counter:04d}_bbox_{bbox}.png")
+            if hasattr(crop, 'save'):
+                crop.save(crop_path)
+                print(f"[OCR DEBUG] Saved crop: {crop_path}")
+            _ocr_debug_counter += 1
+        except Exception as e:
+            print(f"[OCR DEBUG] Failed to save crop: {e}")
+    
+    # Use MangaOCR (primary engine)
+    # Match original repo: No padding. Pass crop directly.
+    padded_main = crop
+
+    if hasattr(ocr_engine, "recognize_with_confidence"):
+        text, conf = ocr_engine.recognize_with_confidence(padded_main)
+    else:
+        text = ocr_engine.recognize(padded_main)
+        conf = 1.0
+    
+    # DEBUG: Log OCR result
+    if settings and getattr(settings, 'debug_ocr', False):
+        print(f"[OCR DEBUG] bbox={bbox} -> MangaOCR='{text}' conf={conf:.3f}")
+    
+    # For wide boxes (impact text), try PaddleOCR ONLY if MangaOCR fails or is weak
+    # "Extreme cases" fallback as requested
+    if is_wide_box and settings:
+        manga_score = _is_valid_japanese(text)
+        
+        # Only try fallback if MangaOCR result is poor
+        # Threshold: < 0.5 valid Japanese OR very short text (< 2 chars)
+        if manga_score < 0.5 or len(text.strip()) < 2:
+            if _paddle_fallback_instance is None:
+                try:
+                    from app.ocr.paddle_ocr_recognizer import PaddleOcrRecognizer
+                    _paddle_fallback_instance = PaddleOcrRecognizer(settings.use_gpu if settings else False)
+                except Exception as e:
+                    print(f"[OCR] Failed to load PaddleOCR: {e}")
+            
+            if _paddle_fallback_instance:
+                try:
+                    p_text = _paddle_fallback_instance.recognize(padded_main)
+                    p_text = p_text.replace(" ", "") if p_text else ""
+                    
+                    paddle_score = _is_valid_japanese(p_text)
+                    manga_stripped = text.replace(" ", "")
+                    
+                    if settings and getattr(settings, 'debug_ocr', False):
+                        print(f"[OCR DEBUG] Fallback Triggered | MangaOCR='{text}'({manga_score:.2f}) vs PaddleOCR='{p_text}'({paddle_score:.2f})")
+                    
+                    # Only switch if PaddleOCR is significantly better
+                    if paddle_score > manga_score and len(p_text) >= len(manga_stripped):
+                        if settings and getattr(settings, 'debug_ocr', False):
+                            print(f"[OCR DEBUG] Using PaddleOCR result (Rescue)")
+                        text = p_text
+                        conf = 0.9
+                except Exception:
+                    pass
+                finally:
+                    # CRITICAL: Unload PaddleOCR immediately to prevent VRAM leak/contention
+                    # This fallback is rare, so we prioritize memory over reload speed
+                    try:
+                        if hasattr(_paddle_fallback_instance, "unload"):
+                            _paddle_fallback_instance.unload()
+                        del _paddle_fallback_instance
+                        _paddle_fallback_instance = None
+                        import gc
+                        gc.collect()
+                    except Exception:
+                        pass
+                    _paddle_fallback_instance = None
+        else:
+             if settings and getattr(settings, 'debug_ocr', False):
+                 print(f"[OCR DEBUG] Skipping PaddleOCR fallback (MangaOCR Score {manga_score:.2f} >= 0.5)")
+
+    if settings and getattr(settings, 'debug_ocr', False):
+         print(f"[OCR CRITICAL] Chosen Text: '{text}' (ValidScore: {_is_valid_japanese(text):.2f}) for bbox={bbox}")
+
+    return _clean_ocr_text(text), conf
+
+
 def _process_page(
     image_path: str,
     detector,
@@ -877,6 +1053,7 @@ def _process_page(
     if not image_path or not os.path.exists(image_path):
         return []
     image_size = _get_image_size(image_path)
+    page_image = _load_image_for_crop(image_path)
     # Pass input_size if the detector supports it (ComicTextDetector)
     if hasattr(detector, "detect"):
         try:
@@ -920,16 +1097,20 @@ def _process_page(
         det_conf = group["conf"]
         is_bg_group = bool(group.get("bg_text"))
         if is_bg_group:
-            crop = _crop_image(image_path, bbox)
+            crop = _crop_image(image_path, bbox, image_obj=page_image)
             if crop is None:
                 continue
-            ocr_text = _clean_ocr_text(ocr_engine.recognize(crop))
+            ocr_text, ocr_conf = _recognize_with_fallback(ocr_engine, crop, settings, bbox)
             if not ocr_text:
                 continue
             if text_filter.should_ignore(ocr_text, "background_text"):
                 # Skip SFX entirely (do not add region / do not mark needs_review)
-                continue
+                # UNLESS it's valid Japanese dialogue (override filter)
+                if _is_valid_japanese(ocr_text) < 0.6:
+                    continue
+            
             glossary_texts.append(ocr_text)
+            
             if _should_skip_text(ocr_text, bbox, image_size):
                 regions.append(
                     _region_record(
@@ -944,6 +1125,7 @@ def _process_page(
                         ignore=True,
                         font_name=font_name,
                         region_type="background_text",
+                        ocr_conf=ocr_conf,
                     )
                 )
                 continue
@@ -959,6 +1141,7 @@ def _process_page(
                 ignore=False,
                 font_name=font_name,
                 region_type="background_text",
+                ocr_conf=ocr_conf,
             )
             regions.append(region)
             cached = translation_cache.get(ocr_text)
@@ -975,18 +1158,23 @@ def _process_page(
             filter_strength,
         )
         if bg_text:
-            crop = _crop_image(image_path, bbox)
+            crop = _crop_image(image_path, bbox, image_obj=page_image)
             if crop is None:
                 continue
-            ocr_text = _clean_ocr_text(ocr_engine.recognize(crop))
+            ocr_text, ocr_conf = _recognize_with_fallback(ocr_engine, crop, settings, bbox)
             if not ocr_text:
                 continue
             if text_filter.should_ignore(ocr_text, "background_text"):
                 # Skip SFX entirely (do not add region / do not mark needs_review)
-                continue
+                # UNLESS it's valid Japanese dialogue (override filter)
+                if _is_valid_japanese(ocr_text) < 0.6:
+                    continue
+            
             glossary_texts.append(ocr_text)
+            
             skip_text = _should_skip_text(ocr_text, bbox, image_size)
             ignore = bool(filter_background and skip_text)
+            
             region = _region_record(
                 idx,
                 polygons,
@@ -994,11 +1182,12 @@ def _process_page(
                 ocr_text,
                 "",
                 det_conf,
-                bg_text=True,
+                bg_text=bg_text,
                 needs_review=needs_review or skip_text,
                 ignore=ignore,
                 font_name=font_name,
                 region_type="background_text",
+                ocr_conf=ocr_conf,
             )
             regions.append(region)
             if ignore:
@@ -1009,46 +1198,28 @@ def _process_page(
             else:
                 pending_texts.setdefault(ocr_text, []).append(region["region_id"])
             continue
-        crop = _crop_image(image_path, bbox)
+        crop = _crop_image(image_path, bbox, image_obj=page_image)
         if crop is None:
             continue
-        ocr_text = _clean_ocr_text(ocr_engine.recognize(crop))
+        ocr_text, ocr_conf = _recognize_with_fallback(ocr_engine, crop, settings, bbox)
         if not ocr_text:
             continue
         glossary_texts.append(ocr_text)
-        if _should_skip_text(ocr_text, bbox, image_size):
-            regions.append(
-                _region_record(
-                    idx,
-                    polygons,
-                    bbox,
-                    ocr_text,
-                    "",
-                    det_conf,
-                    bg_text=True,
-                    needs_review=True,
-                    ignore=True,
-                    font_name=font_name,
-                    region_type="background_text",
-                )
-            )
-            continue
+        # REMOVED: _should_skip_text filter for speech bubbles
+        # Speech bubbles detected by the detector should NEVER be filtered
+        # They are legitimate dialogue that must always be translated
         detected_font = None
         if font_detector is not None:
             try:
                 detected_font = font_detector.detect(crop)
             except Exception:
                 detected_font = None
-        
-        if font_detector is not None:
-            try:
-                detected_font = font_detector.detect(crop)
-            except Exception:
-                detected_font = None
 
-        
-        # Centralized Filter Query
-        is_bg_sfx = text_filter.should_ignore(ocr_text, "speech_bubble")
+
+
+        # REMOVED: TextFilter check for speech bubbles
+        # Speech bubbles detected by the detector should NEVER be filtered
+        # They are legitimate dialogue - always translate them
         
         region = _region_record(
             idx,
@@ -1057,11 +1228,12 @@ def _process_page(
             ocr_text,
             "",
             det_conf,
-            bg_text=is_bg_sfx,
+            bg_text=False,  # Speech bubble, not background
             needs_review=needs_review,
-            ignore=is_bg_sfx,
+            ignore=False,   # NEVER ignore speech bubbles
             font_name=font_name,
-            region_type="background_text" if is_bg_sfx else "speech_bubble",
+            region_type="speech_bubble",
+            ocr_conf=ocr_conf,
         )
         if detected_font:
             if target_lang == "Simplified Chinese" and not _is_font_allowed_for_cn(detected_font):
@@ -1074,7 +1246,6 @@ def _process_page(
         cached = translation_cache.get(ocr_text)
         if cached is not None:
             region["translation"] = cached
-            region["translation"] = cached
         elif region.get("ignore") and text_filter.should_ignore(ocr_text, "background_text"):
             # Skip background text if the filter agrees it's skippable (SFX)
             # This allows Plot Descriptions (which don't look like SFX) to pass through.
@@ -1082,8 +1253,15 @@ def _process_page(
         else:
             pending_texts.setdefault(ocr_text, []).append(region["region_id"])
     active_style_guide = style_guide
-    active_style_guide = style_guide
-    if auto_glossary_state is not None and glossary_texts:
+    
+    # Skip runtime discovery if Pre-Scan is enabled (glossary is already built)
+    should_run_discovery = (
+        auto_glossary_state is not None 
+        and glossary_texts 
+        and not (settings and settings.prescan_enabled)
+    )
+    
+    if should_run_discovery:
         if _GLOSSARY_DEBUG:
             import tempfile
             log_path = os.path.join(tempfile.gettempdir(), "auto_glossary_debug.log")
@@ -1344,16 +1522,43 @@ def _dedupe_groups(groups: list, overlap_threshold: float = 0.85) -> list:
     return deduped
 
 
-def _crop_image(image_path: str, bbox: list):
+def _load_image_for_crop(image_path: str):
+    """Load an RGB image once for repeated region crops."""
     try:
         from PIL import Image
     except ImportError:
         return None
     try:
         with Image.open(image_path) as img:
-            img = img.convert("RGB")
-            x, y, w, h = [int(v) for v in bbox]
-            return img.crop((x, y, x + w, y + h))
+            return img.convert("RGB")
+    except Exception:
+        return None
+
+
+def _crop_image(image_path: str, bbox: list, expand_wide: bool = True, image_obj=None):
+    """Crop image at bbox. Optionally expands wide regions to capture clipped text."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        img = image_obj if image_obj is not None else _load_image_for_crop(image_path)
+        if img is None:
+            return None
+        img_w, img_h = img.size
+        x, y, w, h = [int(v) for v in bbox]
+
+        # Expand wide regions (likely impact text with clipped edges)
+        # Detection often clips sides of stylized horizontal text
+        if expand_wide and h > 0 and w > h * 2:
+            # Expand by 15% of width on each side for wide text
+            expand = int(w * 0.15)
+            x = max(0, x - expand)
+            # Recalculate width to reach original right edge + expansion
+            x_right = min(img_w, int(bbox[0]) + int(bbox[2]) + expand)
+            w = x_right - x
+
+        return img.crop((x, y, x + w, y + h))
     except Exception:
         return None
 
@@ -1479,7 +1684,7 @@ def _clean_translation(text: str) -> str:
     cleaned = re.sub(r"<\s*e=\d+\s*>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\be=\d+\b", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"e=\d+", "", cleaned, flags=re.IGNORECASE)
-    cleaned = cleaned.replace("□", "").replace("", "")
+    cleaned = cleaned.replace("□", "")
     cleaned = re.sub(r"(?:口|□){2,}", "", cleaned)
     if _placeholder_ratio(cleaned) >= 0.15:
         cleaned = cleaned.replace("口", "")
@@ -1511,6 +1716,27 @@ def _clean_translation(text: str) -> str:
         "只输出翻译",
         "译文如下",
         "翻译如下",
+        # Kana-related prompt phrases (from retry prompts)
+        "重要：",
+        "重要:",
+        "你的回答中",
+        "绝对不能包含",
+        "不能包含",
+        "日语假名",
+        "ひらがな",
+        "カタカナ",
+        "只能使用",
+        "纯中文",
+        "汉字进行翻译",
+        "进行翻译",
+        "将下面的日语翻译成",
+        "翻译成简体中文",
+        "只输出简体中文",
+        "不要片假名",
+        "不要平假名",
+        "罗马音或英文",
+        "日语原文",
+        "请将日语",
     ]
     for line in lines:
         head = line.strip()
@@ -1521,6 +1747,8 @@ def _clean_translation(text: str) -> str:
             or lower.startswith("文本：")
             or lower.startswith("context:")
             or lower.startswith("input:")
+            or lower.startswith("重要：")
+            or lower.startswith("重要:")
             or "return only the translation" in lower
             or "output only the translation" in lower
             or "no labels" in lower
@@ -1528,6 +1756,18 @@ def _clean_translation(text: str) -> str:
             or "no explanations" in lower
             or "<<text>>" in lower
             or "<</text>>" in lower
+            # Chinese/Japanese prompt leak patterns
+            or "ひらがな" in head
+            or "カタカナ" in head
+            or "日语假名" in head
+            or "绝对不能包含" in head
+            or "纯中文汉字" in head
+            or "只能使用" in head
+            or "进行翻译" in head
+            or "翻译成简体中文" in head
+            or "将下面的日语翻译成" in head
+            or "请将日语" in head
+            or "日语原文" in head
         ):
             continue
         head = head.replace("文本：", "").replace("文本:", "")
@@ -1911,12 +2151,14 @@ def _trigger_discovery_if_needed(
     is_real_ollama = hasattr(ollama, "list_models")
     use_deep_scan = False
     
-    # Resolve backend preference
-    # Default to Ollama if not specified, unless model path looks like GGUF
+    # Resolve backend preference.
+    # MeCab-only mode must never invoke LLM discovery.
     backend = getattr(settings, "discovery_backend", "Ollama") if settings else "Ollama"
-    
-    # 1. GGUF Backend
-    if backend == "GGUF" or (discovery_model and ".gguf" in discovery_model.lower()):
+    if not allow_ollama:
+        backend = "MeCab"
+
+    # 1. GGUF Backend (LLM discovery path)
+    if allow_ollama and (backend == "GGUF" or (discovery_model and ".gguf" in discovery_model.lower())):
         target_path = str(discovery_model or "").strip()
         translation_path = getattr(settings, "gguf_model_path", "") if settings else ""
         needs_swap = (
@@ -1960,7 +2202,7 @@ def _trigger_discovery_if_needed(
             logger.warning("Deep Scan: GGUF backend selected but invalid path string.")
 
     # 2. Ollama Backend
-    elif backend == "Ollama":
+    elif allow_ollama and backend == "Ollama":
         # If user explicitly wants Deep Scan via Ollama (allowed)
         if (discovery_model and discovery_model.lower() not in ["auto-detect", "none", ""]) or allow_ollama:
             if is_real_ollama:
@@ -2027,7 +2269,16 @@ def _trigger_discovery_if_needed(
             logger.info(f"STARTING DISCOVERY IN BACKGROUND (MeCab Mode)")
             t = threading.Thread(
                 target=target_func,
-                args=(discovery_client, model, source_lang, target_lang, state, base_style, style_guide_path, discovery_model)
+                args=(
+                    discovery_client,
+                    model,
+                    source_lang,
+                    target_lang,
+                    state,
+                    base_style,
+                    style_guide_path,
+                    bool(discovery_client and hasattr(discovery_client, "generate")),
+                )
             )
             t.daemon = True
             t.start()
@@ -2075,8 +2326,15 @@ def _run_sakura_discovery(
         logger.info("Deep Scan: Using GGUF Client.")
 
     try:
+        main_model = str(main_model or "")
     # Check if main_model is a valid Ollama model (not a path)
-        is_gguf_path = "os.path.sep" in main_model or "/" in main_model or "\\" in main_model or ".gguf" in main_model.lower()
+        is_gguf_path = (
+            os.path.sep in main_model
+            or "/" in main_model
+            or "\\" in main_model
+            or main_model.lower().endswith(".gguf")
+            or os.path.isfile(main_model)
+        )
         if not is_gguf_path and "sakura" not in main_model.lower():
              extraction_model = main_model
              
@@ -2243,6 +2501,7 @@ def _run_discovery(
     state: dict,
     base_style: dict,
     style_guide_path: str,
+    translate_entities: bool = False,
 ):
     """
     Background worker for Auto-Glossary discovery using MeCab.
@@ -2308,24 +2567,28 @@ def _run_discovery(
                 # Translate each group
                 for group in groups:
                     # Translate canonical name first
-                    canonical_trans = _translate_name(ollama, resolved_model, group.canonical, target_lang)
-                    if not canonical_trans:
-                        continue
+                    canonical_trans = ""
+                    if translate_entities:
+                        canonical_trans = _translate_name(ollama, resolved_model, group.canonical, target_lang)
+                        if not canonical_trans:
+                            continue
                         
                     with _glossary_lock:
                         glossary_map = state.setdefault("map", {})
                         characters_list = state.setdefault("characters", [])
                         
-                        glossary_map[group.canonical] = {
-                            "target": canonical_trans,
-                            "reading": group.canonical_reading,
-                            "pattern": "canonical",
-                            "type": "proper_noun"
-                        }
+                        if canonical_trans:
+                            glossary_map[group.canonical] = {
+                                "target": canonical_trans,
+                                "reading": group.canonical_reading,
+                                "pattern": "canonical",
+                                "type": "proper_noun"
+                            }
                         
                         # Track this as a character
                         char_entry = {
-                            "name": canonical_trans,
+                            "name": canonical_trans or group.canonical,
+                            "translation": canonical_trans,
                             "original": group.canonical,
                             "reading": group.canonical_reading,
                             "gender": "unknown",
@@ -2337,22 +2600,25 @@ def _run_discovery(
                         alias_source = alias["source"]
                         alias_hint = alias.get("hint", "")
                         
-                        alias_trans = _translate_alias(
-                            ollama, resolved_model,
-                            alias_source, alias_hint,
-                            canonical_trans, target_lang
-                        )
-                        if not alias_trans:
-                            continue
+                        alias_trans = ""
+                        if translate_entities:
+                            alias_trans = _translate_alias(
+                                ollama, resolved_model,
+                                alias_source, alias_hint,
+                                canonical_trans, target_lang
+                            )
+                            if not alias_trans:
+                                continue
                         
                         with _glossary_lock:
-                            glossary_map[alias_source] = {
-                                "target": alias_trans,
-                                "reading": alias.get("reading", ""),
-                                "pattern": alias.get("pattern", ""),
-                                "hint": alias.get("hint", ""),
-                                "type": "proper_noun"
-                            }
+                            if alias_trans:
+                                glossary_map[alias_source] = {
+                                    "target": alias_trans,
+                                    "reading": alias.get("reading", ""),
+                                    "pattern": alias.get("pattern", ""),
+                                    "hint": alias.get("hint", ""),
+                                    "type": "proper_noun"
+                                }
                             
                             # Store full alias object with translation
                             alias_obj = dict(alias)
@@ -2384,32 +2650,32 @@ def _run_discovery(
                     # Skip if already in glossary
                     if name.surface in glossary_map:
                         continue
-                    
-                    trans = _translate_name(ollama, resolved_model, name.surface, target_lang)
-                    if not trans:
-                        continue
-                    
-                    with _glossary_lock:
-                        glossary_map[name.surface] = {
-                            "target": trans,
-                            "reading": name.reading,
-                            "pattern": "standalone",
-                            "type": "proper_noun"
-                        }
+                    if translate_entities:
+                        trans = _translate_name(ollama, resolved_model, name.surface, target_lang)
+                        if not trans:
+                            continue
+                        with _glossary_lock:
+                            glossary_map[name.surface] = {
+                                "target": trans,
+                                "reading": name.reading,
+                                "pattern": "standalone",
+                                "type": "proper_noun"
+                            }
             else:
                 pass
                 
         except ImportError:
             # Fallback to old heuristic method
-            heuristic_names = _extract_names_heuristic(buffer)
-            for name in heuristic_names:
-                trans = _translate_name(ollama, resolved_model, name, target_lang)
-                if not trans:
-                    continue
-                with _glossary_lock:
-                    glossary_map = state.setdefault("map", {})
-                    if name not in glossary_map:
-                        glossary_map[name] = trans
+            if translate_entities:
+                heuristic_names = _extract_names_heuristic(buffer)
+                for name in heuristic_names:
+                    trans = _translate_name(ollama, resolved_model, name, target_lang)
+                    if not trans:
+                        continue
+                    with _glossary_lock:
+                        glossary_map = state.setdefault("map", {})
+                        if name not in glossary_map:
+                            glossary_map[name] = trans
         
         # Save to disk
         with _glossary_lock:
@@ -2602,16 +2868,25 @@ def _ensure_target_language(
 
     if _language_ok(target_lang, translation) and not _looks_like_prompt_leak(translation):
         return translation, True
-    retry_prompt = (
-        f"Translate {source_lang} to {target_lang}.\n"
-        "No English, no romaji, no explanations.\n"
-        f"Text: {ocr_text}\n"
-    )
+    
+    # Build retry prompt - be explicit about language requirements
+    if target_lang == "Simplified Chinese":
+        retry_prompt = (
+            f"将下面的日语翻译成简体中文。\n"
+            f"只输出简体中文译文，不要片假名、平假名、罗马音或英文。\n"
+            f"日语原文: {ocr_text}\n"
+        )
+    else:
+        retry_prompt = (
+            f"Translate {source_lang} to {target_lang}.\n"
+            "No English, no romaji, no explanations.\n"
+            f"Text: {ocr_text}\n"
+        )
     retry = _clean_translation(
         ollama.generate(
             model,
             retry_prompt,
-            timeout=180,
+            timeout=30,
             options={"num_predict": 128, "temperature": 0.1, "top_p": 0.9},
         )
     )
@@ -2619,6 +2894,26 @@ def _ensure_target_language(
         retry = _translate_strict(ollama, model, source_lang, target_lang, ocr_text)
     if _language_ok(target_lang, retry) and not _looks_like_prompt_leak(retry):
         return retry, True
+    
+    # Second retry for Chinese if still has Kana - be even more explicit
+    if target_lang == "Simplified Chinese" and _kana_ratio(retry) > 0.05:
+        final_prompt = (
+            f"请将日语'{ocr_text}'翻译成中文。\n"
+            f"重要：你的回答中绝对不能包含日语假名（ひらがな/カタカナ）。\n"
+            f"只能使用纯中文汉字进行翻译。\n"
+        )
+        final = _clean_translation(
+            ollama.generate(
+                model,
+                final_prompt,
+                timeout=30,
+                options={"num_predict": 128, "temperature": 0.05, "top_p": 0.9},
+            )
+        )
+        if _language_ok(target_lang, final) and not _looks_like_prompt_leak(final):
+            return final, True
+        retry = final if final else retry
+    
     if _looks_like_prompt_leak(retry or translation):
         return "", False
     return retry or translation, False
@@ -2650,7 +2945,7 @@ def _translate_brief(
     result = ollama.generate(
         _resolve_model(model),
         prompt,
-        timeout=180,
+        timeout=30,
         options={"num_predict": 128, "temperature": 0.1, "top_p": 0.9},
     )
     return _clean_translation(result)
@@ -2706,6 +3001,13 @@ def _looks_like_prompt_leak(text: str) -> bool:
         "不要英文",
         "不要罗马音",
         "不要羅馬音",
+        # Additional patterns seen in user-reported prompt leaks
+        "不要用英语",
+        "不要用罗马音",
+        "不要加解释",
+        "没有英语",
+        "没有罗马音",
+        "没有解释",
     ]
     if any(m in lowered for m in markers):
         return True
@@ -2760,6 +3062,12 @@ def _should_skip_text(text: str, bbox: list, image_size: tuple[int, int]) -> boo
         return True
     if _placeholder_ratio(text) >= 0.15:
         return True
+    
+    # CRITICAL FIX: If text is strongly valid Japanese, NEVER skip it
+    # This ensures short dialogue like "フ…", "そ", "え?" are always translated
+    if _is_valid_japanese(text) >= 0.6:
+        return False
+    
     x, y, w, h = bbox
     area = w * h
     img_w, img_h = image_size
@@ -2768,7 +3076,14 @@ def _should_skip_text(text: str, bbox: list, image_size: tuple[int, int]) -> boo
     length = len(text)
     jp_ratio = _japanese_ratio(text)
     if length <= 2 and ratio < 0.003:
+        # Check aspect ratio for very small boxes
         aspect = w / h if h else 0
+        
+        # FIX: "そ" and vertical text (tall/narrow) are often skipped by current aspect ratio check (0.3 < aspect < 3.5)
+        # If it's strongly Japanese, KEEP IT regardless of aspect ratio
+        if _is_valid_japanese(text) >= 0.5:
+             return False
+
         if jp_ratio >= 0.6 and 0.3 < aspect < 3.5:
             return False
         return True
@@ -2809,8 +3124,30 @@ def _clean_ocr_text(text: str) -> str:
     cleaned = cleaned.replace("□", "").replace("�", "")
     if _placeholder_ratio(cleaned) >= 0.2:
         cleaned = cleaned.replace("口", "")
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    
+    # For CJK text, remove ALL spaces (Japanese/Chinese don't use word spaces)
+    # Use _is_valid_japanese score which correctly includes punctuation
+    # If score > 0.4, it's likely Japanese/Chinese text
+    stripped = cleaned.replace(" ", "")
+    if stripped and _is_valid_japanese(stripped) > 0.4:
+        # Remove all spaces from Japanese-dominant text
+        cleaned = stripped
+    
+    # For non-CJK text, just normalize whitespace
+    if " " in cleaned:
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    
     return cleaned
+
+
+def _is_cjk_char(ch: str) -> bool:
+    """Check if character is CJK (Chinese/Japanese/Korean)."""
+    code = ord(ch)
+    return (
+        0x4E00 <= code <= 0x9FFF       # CJK Unified Ideographs
+        or 0x3040 <= code <= 0x30FF    # Hiragana + Katakana
+        or 0x3400 <= code <= 0x4DBF    # CJK Extension A
+    )
 
 
 def _is_japanese(ch: str) -> bool:
@@ -2854,6 +3191,7 @@ def _region_record(
     ignore: bool,
     font_name: str,
     region_type: str = "speech_bubble",
+    ocr_conf: float = 1.0,
 ) -> dict:
     return {
         "region_id": f"r{idx:03d}",
@@ -2862,7 +3200,7 @@ def _region_record(
         "type": region_type,
         "ocr_text": ocr_text,
         "translation": translation,
-        "confidence": {"det": det_conf, "ocr": 1.0, "trans": 1.0},
+        "confidence": {"det": det_conf, "ocr": ocr_conf, "trans": 1.0},
         "render": {
             "font": font_name,
             "font_size": 0,
@@ -3002,6 +3340,58 @@ def _contains_term(text: str, term: str) -> bool:
     return re.search(pattern, text, flags=re.IGNORECASE) is not None
 
 
+def _normalize_character_entry(entry: dict) -> dict:
+    """Normalize character schema to a stable structure for all pipeline consumers."""
+    if not isinstance(entry, dict):
+        return {}
+    original = str(entry.get("original") or entry.get("canonical") or "").strip()
+    reading = str(entry.get("reading") or entry.get("canonical_reading") or "").strip()
+    translation = str(entry.get("translation") or "").strip()
+    name = str(entry.get("name") or "").strip()
+    if not original and name:
+        original = name
+    if not name:
+        name = translation or original
+    aliases_raw = entry.get("aliases", []) or []
+    aliases = []
+    for alias in aliases_raw:
+        if isinstance(alias, dict):
+            source = str(alias.get("source", "")).strip()
+            target = str(alias.get("target", "") or alias.get("translation", "")).strip()
+            if source:
+                aliases.append(
+                    {
+                        "source": source,
+                        "target": target,
+                        "reading": str(alias.get("reading", "")).strip(),
+                        "pattern": str(alias.get("pattern", "")).strip(),
+                        "hint": str(alias.get("hint", "")).strip(),
+                    }
+                )
+        else:
+            source = str(alias).strip()
+            if source:
+                aliases.append(
+                    {
+                        "source": source,
+                        "target": translation,
+                        "reading": "",
+                        "pattern": "",
+                        "hint": "",
+                    }
+                )
+    return {
+        "canonical": original,
+        "original": original,
+        "name": name,
+        "translation": translation,
+        "reading": reading,
+        "gender": str(entry.get("gender", "")).strip(),
+        "info": str(entry.get("info", "")).strip(),
+        "aliases": aliases,
+    }
+
+
 def _find_inconsistent_pages(pages: list, style_guide: dict) -> list[int]:
     if not pages or not isinstance(style_guide, dict):
         return []
@@ -3017,27 +3407,28 @@ def _find_inconsistent_pages(pages: list, style_guide: dict) -> list[int]:
         term_targets.setdefault(src, set()).add(tgt)
     characters = style_guide.get("characters", [])
     if isinstance(characters, list):
-        for char in characters:
-            if not isinstance(char, dict):
+        for raw_char in characters:
+            char = _normalize_character_entry(raw_char)
+            if not char:
                 continue
             original = str(char.get("original", "")).strip()
-            name = str(char.get("name", "")).strip()
-            if original and name:
-                term_targets.setdefault(original, set()).add(name)
-            aliases = char.get("aliases", [])
-            if not isinstance(aliases, list):
-                continue
+            translation = str(char.get("translation", "")).strip()
+            canonical_target = translation
+            if original and canonical_target and canonical_target != original:
+                term_targets.setdefault(original, set()).add(canonical_target)
+            aliases = char.get("aliases", []) or []
             for alias in aliases:
-                if not isinstance(alias, dict):
-                    continue
                 alias_source = str(alias.get("source", "")).strip()
                 alias_target = str(alias.get("target", "")).strip()
-                if not alias_source or not alias_target:
+                if not alias_source:
                     continue
-                targets = term_targets.setdefault(alias_source, set())
-                targets.add(alias_target)
-                if name:
-                    targets.add(name)
+                alias_targets = set()
+                if alias_target and alias_target != alias_source:
+                    alias_targets.add(alias_target)
+                if canonical_target and canonical_target != alias_source:
+                    alias_targets.add(canonical_target)
+                if alias_targets:
+                    term_targets.setdefault(alias_source, set()).update(alias_targets)
     if not term_targets:
         return []
     terms = list(term_targets.items())
@@ -3072,19 +3463,28 @@ def _sanitize_style_guide(style_guide: dict, target_lang: str) -> dict:
     glossary = style_guide.get("glossary", [])
     cleaned_glossary = []
     changed = False
-    # Collect aliases for name validation
+    # Normalize characters to a single schema.
+    normalized_chars = []
+    raw_chars = style_guide.get("characters", []) or []
+    for raw_char in raw_chars:
+        norm = _normalize_character_entry(raw_char)
+        if norm and norm.get("original"):
+            normalized_chars.append(norm)
+    if raw_chars != normalized_chars:
+        style_guide = dict(style_guide)
+        style_guide["characters"] = normalized_chars
+        changed = True
+
+    # Collect aliases for name validation.
     alias_sources = set()
-    for char in style_guide.get("characters", []) or []:
-        if not isinstance(char, dict):
-            continue
+    for char in normalized_chars:
         original = str(char.get("original", "")).strip()
         if original:
             alias_sources.add(original)
         for alias in char.get("aliases", []) or []:
-            if isinstance(alias, dict):
-                src = str(alias.get("source", "")).strip()
-                if src:
-                    alias_sources.add(src)
+            src = str(alias.get("source", "")).strip()
+            if src:
+                alias_sources.add(src)
     honorifics = ("さん", "くん", "ちゃん", "様", "先生", "先輩", "殿", "君", "氏")
     for item in glossary:
         if not isinstance(item, dict):
@@ -3162,6 +3562,8 @@ def _merge_glossary(style_guide: dict, new_map: dict, new_chars: list) -> dict:
             # Update existing if needed (e.g. add metadata)
             entry = existing_map[src]
             if entry.get("auto"):
+                 if target and target != entry.get("target", ""):
+                     entry["target"] = target
                  if reading and "reading" not in entry:
                      entry["reading"] = reading
                  if pattern and "pattern" not in entry:
@@ -3169,15 +3571,25 @@ def _merge_glossary(style_guide: dict, new_map: dict, new_chars: list) -> dict:
                  if hint and "hint" not in entry:
                      entry["hint"] = hint
     
-    # Merge characters
-    sg_chars = style_guide.setdefault("characters", [])
-    existing_chars = {c.get("original"): c for c in sg_chars if isinstance(c, dict) and c.get("original")}
+    # Merge characters with normalized schema.
+    sg_chars_raw = style_guide.setdefault("characters", [])
+    sg_chars = []
+    existing_chars = {}
+    for c in sg_chars_raw:
+        norm = _normalize_character_entry(c)
+        if not norm or not norm.get("original"):
+            continue
+        key = norm.get("original")
+        sg_chars.append(norm)
+        existing_chars[key] = norm
+    style_guide["characters"] = sg_chars
 
     if new_chars:
         for char in new_chars:
-            if not isinstance(char, dict):
+            norm_char = _normalize_character_entry(char)
+            if not norm_char:
                 continue
-            original = char.get("original", "").strip()
+            original = norm_char.get("original", "").strip()
             if len(original) > 20 or "处理用户" in original or "需要" in original:
                 continue
             if not original:
@@ -3185,19 +3597,30 @@ def _merge_glossary(style_guide: dict, new_map: dict, new_chars: list) -> dict:
 
             existing = existing_chars.get(original)
             if existing is None:
-                sg_chars.append(char)
-                existing_chars[original] = char
+                sg_chars.append(norm_char)
+                existing_chars[original] = norm_char
                 continue
 
-            new_aliases = char.get("aliases", [])
+            new_aliases = norm_char.get("aliases", [])
+            # Fill canonical fields if the existing entry is incomplete.
+            if not existing.get("translation") and norm_char.get("translation"):
+                existing["translation"] = norm_char.get("translation")
+            if (not existing.get("name") or existing.get("name") == original) and norm_char.get("name"):
+                existing["name"] = norm_char.get("name")
+            if not existing.get("reading") and norm_char.get("reading"):
+                existing["reading"] = norm_char.get("reading")
+            if not existing.get("gender") and norm_char.get("gender"):
+                existing["gender"] = norm_char.get("gender")
+            if not existing.get("info") and norm_char.get("info"):
+                existing["info"] = norm_char.get("info")
             existing_aliases = existing.setdefault("aliases", [])
             existing_alias_sources = set()
             for a in existing_aliases:
-                s = a.get("source") if isinstance(a, dict) else a
+                s = a.get("source") if isinstance(a, dict) else str(a)
                 if s:
                     existing_alias_sources.add(s)
             for alias in new_aliases:
-                src = alias.get("source") if isinstance(alias, dict) else alias
+                src = alias.get("source") if isinstance(alias, dict) else str(alias)
                 if src and src not in existing_alias_sources:
                     existing_aliases.append(alias)
                     existing_alias_sources.add(src)

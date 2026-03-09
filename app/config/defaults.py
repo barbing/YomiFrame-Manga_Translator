@@ -14,7 +14,7 @@ MANGA_OCR_FILES = [
     "preprocessor_config.json", 
     "pytorch_model.bin",
     "special_tokens_map.json",
-    "spiece.model",
+    "vocab.txt",
     "tokenizer_config.json"
 ]
 

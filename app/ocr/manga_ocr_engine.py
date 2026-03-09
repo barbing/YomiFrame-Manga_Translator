@@ -40,7 +40,126 @@ def _preload_torch_dlls() -> None:
                 pass
 
 
+def resolve_manga_ocr_model_ref() -> str | None:
+    """Resolve the best MangaOCR model reference: system cache, local path, or None."""
+    try:
+        hf_home = os.environ.get("HF_HOME")
+        if not hf_home:
+            hf_home = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+        cache_path = os.path.join(hf_home, "hub", "models--kha-white--manga-ocr-base")
+        snapshots = os.path.join(cache_path, "snapshots")
+        if os.path.exists(snapshots) and os.listdir(snapshots):
+            return "kha-white/manga-ocr-base"
+    except Exception:
+        pass
+
+    app_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    model_path = os.path.join(app_root, "models", "manga-ocr")
+    if os.path.exists(os.path.join(model_path, "pytorch_model.bin")):
+        return model_path
+    return None
+
+
+def create_manga_ocr_instance(use_gpu: bool):
+    """Create MangaOCR instance using shared model resolution logic."""
+    try:
+        from manga_ocr import MangaOcr
+    except Exception as exc:
+        raise RuntimeError(f"Failed to import manga-ocr: {exc}") from exc
+
+    model_ref = resolve_manga_ocr_model_ref()
+    if model_ref:
+        return MangaOcr(pretrained_model_name_or_path=model_ref, force_cpu=not use_gpu)
+    # Final fallback (library default behavior, may download)
+    return MangaOcr(force_cpu=not use_gpu)
+
+
 class MangaOcrEngine:
+    def recognize_with_confidence(self, image) -> tuple[str, float]:
+        """Recognize text and return confidence score."""
+        try:
+            import numpy as np
+            from PIL import Image
+            import cv2
+            if isinstance(image, np.ndarray):
+                if image.ndim == 3 and image.shape[2] == 3:
+                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(image)
+            
+            # CRITICAL: MangaOCR expects RGB inputs.
+            # If input is Grayscale (L) or RGBA, convert to RGB to match standard library behavior.
+            if hasattr(image, "convert"):
+                image = image.convert("RGB")
+        except Exception:
+            pass
+
+        try:
+            import torch
+            import numpy as np
+            
+            # Access internal components
+            if not hasattr(self._engine, "model") or not hasattr(self._engine, "processor"):
+                return self._engine(image), 1.0
+
+            model = self._engine.model
+            processor = self._engine.processor
+            tokenizer = getattr(self._engine, "tokenizer", None)
+            if tokenizer is None:
+                return self._engine(image), 1.0
+            
+            # Prepare input - Match manga-ocr behavior exactly
+            pixel_values = processor(images=image, return_tensors="pt").pixel_values
+            pixel_values = pixel_values.to(model.device)
+            if model.device.type == "cuda":
+                pixel_values = pixel_values.to(model.dtype)
+
+            # Generate with scores
+            # Forces greedy decoding (num_beams=1) to match standard behavior
+            # AND include standard args (if any) from the engine wrapper
+            gen_args = getattr(self._engine, "args", {})
+            
+            with torch.no_grad():
+                outputs = model.generate(
+                    pixel_values, 
+                    output_scores=True,
+                    return_dict_in_generate=True,
+                    **gen_args,
+                )
+            
+            sequences = outputs.sequences
+            scores = outputs.scores
+            
+            text = tokenizer.decode(sequences[0], skip_special_tokens=True)
+            # CRITICAL: Clean up artifacts (SentencePiece spaces)
+            text = text.replace(" ", "")
+            
+            # Calculate confidence (mean probability)
+            gens = sequences[0]
+            if hasattr(model.config, "decoder_start_token_id") and gens[0] == model.config.decoder_start_token_id:
+                gens = gens[1:]
+            
+            probs = []
+            for i, score_step in enumerate(scores):
+                if i >= len(gens): break
+                token_id = gens[i]
+                if token_id == tokenizer.eos_token_id:
+                    break
+                    
+                step_probs = torch.softmax(score_step, dim=-1)
+                prob = step_probs[0, token_id].item()
+                probs.append(prob)
+            
+            if not probs:
+                confidence = 0.0
+            else:
+                confidence = float(np.mean(probs))
+                
+            return text, confidence
+            
+        except Exception as e:
+            print(f"[MangaOCR] Confidence extraction failed: {e}")
+            return self._engine(image), 1.0
+
     def __init__(self, use_gpu: bool) -> None:
         _add_dll_search_paths()
         _preload_torch_dlls()
@@ -48,17 +167,33 @@ class MangaOcrEngine:
             import torch  # noqa: F401
         except Exception as exc:  # pragma: no cover - runtime dependency
             raise RuntimeError(f"Failed to load torch: {exc}") from exc
-        try:
-            from manga_ocr import MangaOcr
-        except Exception as exc:
-            raise RuntimeError(f"Failed to import manga-ocr: {exc}") from exc
-        
-        # Check for local model
-        model_path = os.path.join(os.getcwd(), "models", "manga-ocr")
-        if os.path.exists(os.path.join(model_path, "pytorch_model.bin")):
-            self._engine = MangaOcr(pretrained_model_name_or_path=model_path, force_cpu=not use_gpu)
-        else:
-            self._engine = MangaOcr(force_cpu=not use_gpu)
+        self._engine = create_manga_ocr_instance(use_gpu)
 
     def recognize(self, image) -> str:
+        try:
+            import numpy as np
+            from PIL import Image
+            import cv2
+            if isinstance(image, np.ndarray):
+                # Convert BGR (OpenCV) to RGB (PIL)
+                if image.ndim == 3 and image.shape[2] == 3:
+                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(image)
+        except Exception:
+            pass  # Fallback to original input if conversion fails
+            
         return self._engine(image)
+
+    def close(self) -> None:
+        """Release resources."""
+        if hasattr(self, "_engine"):
+            del self._engine
+        
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+        except Exception:
+            pass

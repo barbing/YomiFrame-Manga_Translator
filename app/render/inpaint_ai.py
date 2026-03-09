@@ -20,64 +20,30 @@ def _load_lama_model(device: str):
     import os
     import torch
     
-    # Check for local model first
-    local_path = os.path.join(os.getcwd(), "models", "lama", "big-lama.pt")
-    
-    if os.path.exists(local_path):
-        print(f"[AI Inpaint] Found local BigLama at {local_path}")
-        try:
-             # Load the model directly
-             model = torch.jit.load(local_path, map_location=device)
-             model.eval()
-             model.to(device)
-             
-             # Create a wrapper that reuses simple_lama_inpainting's preprocessing if possible
-             # or implements minimal inference.
-             from simple_lama_inpainting import SimpleLama
-             
-             # Instantiate SimpleLama but prevent it from downloading/loading its own model?
-             # It downloads in __init__.
-             # We can't easily prevent it without patching.
-             # So we will just use our own wrapper that replicates the 'forward' call.
-             
-             class LocalLamaWrapper:
-                 def __init__(self, model, device):
-                     self.model = model
-                     self.device = device
-                     
-                 def __call__(self, image, mask):
-                     # Reuse SimpleLama utils if accessible, or reimplement
-                     # SimpleLama usually does: resize to div-by-8, normalize to [0,1], run model, unnormalize.
-                     # Let's rely on SimpleLama for the logic but patching the model is hard if init fails content check.
-                     # Let's try to monkeypatch torch.hub.load to return our model? Too risky.
-                     
-                     # Fallback: Just let SimpleLama download if we can't easily inject.
-                     # BUT wait, the user wants us to use OUR download.
-                     # So we should probably copy our file to the cache location?
-                     # Cache location: ~/.cache/torch/hub/checkpoints/big-lama.pt
-                     
-                     # Strategy: Symlink or Copy?
-                     pass
-             
-             # COPY STRATEGY:
-             # If we find our local model, and the cache model is missing, copy it there!
-             hub_dir = torch.hub.get_dir()
-             cache_dir = os.path.join(hub_dir, "checkpoints")
-             os.makedirs(cache_dir, exist_ok=True)
-             cache_path = os.path.join(cache_dir, "big-lama.pt")
-             
-             if not os.path.exists(cache_path):
-                 print(f"[AI Inpaint] Copying local model to cache: {cache_path}")
-                 import shutil
-                 shutil.copy2(local_path, cache_path)
-             
-        except Exception as e:
-            print(f"Failed to setup local model: {e}")
-
     try:
         from simple_lama_inpainting import SimpleLama
     except ImportError as exc:
         raise RuntimeError("simple-lama-inpainting is not installed. Run: pip install simple-lama-inpainting") from exc
+    
+    # Check if we have a local model that should be copied to cache
+    app_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    local_path = os.path.join(app_root, "models", "lama", "big-lama.pt")
+    if os.path.exists(local_path):
+        try:
+            hub_dir = torch.hub.get_dir()
+            cache_dir = os.path.join(hub_dir, "checkpoints")
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_path = os.path.join(cache_dir, "big-lama.pt")
+            
+            # Prefer system cache (if it exists, do NOT overwrite from local)
+            if not os.path.exists(cache_path):
+                print(f"[AI Inpaint] Copying local model to cache: {cache_path}")
+                import shutil
+                shutil.copy2(local_path, cache_path)
+            else:
+                 print(f"[AI Inpaint] Found existing system model: {cache_path}")
+        except Exception as e:
+            print(f"[AI Inpaint] Failed to copy local model: {e}")
     
     print(f"[AI Inpaint] Loading SimpleLama model on {device}")
     lama = SimpleLama(device=torch.device(device))

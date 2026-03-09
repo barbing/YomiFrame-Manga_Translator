@@ -10,7 +10,10 @@ import glob
 import torch.nn as nn
 from utils.weight_init import init_weights
 from models.yolov5.common import C3, Conv
-from torchsummary import summary
+try:
+    from torchsummary import summary
+except Exception:
+    summary = None
 import torch.nn.functional as F
 import copy
 
@@ -256,6 +259,8 @@ class TextDetBaseDNN:
         return blks, mask, lines_map
 
 if __name__ == '__main__':
+    if summary is None:
+        raise RuntimeError("torchsummary is required only for __main__ model summary usage.")
     device = 'cuda'
     weights = r'data/yolov5sblk.ckpt'
 

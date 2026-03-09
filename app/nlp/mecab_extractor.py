@@ -175,7 +175,6 @@ class MeCabExtractor:
                 except Exception:
                     pass
 
-    @property
     def is_available(self) -> bool:
         """Check if MeCab is available."""
         return self._mecab_available
@@ -312,8 +311,9 @@ class MeCabExtractor:
                     if next_t['surface'] in garbage_words or next_t['surface'] in self.blacklist_terms:
                         break
                     
-                    # Continue merging if next token is also a proper noun
-                    if next_t['pos1'] == "名詞" and next_t['pos2'] == "固有名詞":
+                    # Continue merging if next token is also a proper noun OR a general noun (often names)
+                    # This fixes splitting like "川神" (Proper) + "百代" (General/Common Noun)
+                    if next_t['pos1'] == "名詞" and (next_t['pos2'] == "固有名詞" or next_t['pos2'] == "一般"):
                         surface += next_t['surface']
                         reading += next_t['kana']
                         j += 1
@@ -390,7 +390,88 @@ class MeCabExtractor:
                         pos="白名单"
                     ))
 
+        # Apply NER heuristics to boost name candidates MeCab missed
+        boosted = self._boost_name_candidates(text, seen)
+        results.extend(boosted)
+
         return results
+    
+    def _boost_name_candidates(self, text: str, already_seen: set) -> list[ExtractedName]:
+        """
+        Apply regex-based heuristics to catch names MeCab might miss.
+        
+        Targets:
+        - Long katakana names (likely foreign names): アレクサンドラ
+        - Katakana + suffix patterns: マリアちゃん, ジョンさん
+        - Short capitalized katakana (2-4 chars): ミカ, サラ
+        - Compound names with の/・: 佐藤の兄さん, マルコ・ポーロ
+        
+        Args:
+            text: Japanese text to analyze
+            already_seen: Set of names already extracted by MeCab
+            
+        Returns:
+            List of additional ExtractedName objects
+        """
+        import re
+        boosted = []
+        
+        # Pattern 1: Long katakana names (4+ chars, likely foreign names)
+        # e.g., アレクサンドラ, クリスティーナ, エリザベス
+        katakana_long = re.findall(r'[ァ-ヺー]{4,}', text)
+        for name in katakana_long:
+            if name not in already_seen and len(name) <= 12:
+                already_seen.add(name)
+                boosted.append(ExtractedName(
+                    surface=name,
+                    reading=self._to_hiragana(name),
+                    pos="人名_外来"
+                ))
+        
+        # Pattern 2: Katakana + Japanese suffix (foreign name + honorific)
+        # e.g., ジョンさん, マリアちゃん, アリス先生
+        katakana_suffix_pattern = re.compile(
+            r'([ァ-ヺー]{2,8})(さん|ちゃん|くん|さま|様|せんせい|先生|せんぱい|先輩)'
+        )
+        for match in katakana_suffix_pattern.finditer(text):
+            name = match.group(1)
+            if name not in already_seen:
+                already_seen.add(name)
+                boosted.append(ExtractedName(
+                    surface=name,
+                    reading=self._to_hiragana(name),
+                    pos="人名_外来"
+                ))
+        
+        # Pattern 3: Short katakana names in quotes or followed by particles
+        # e.g., 「ミカ」, ミカが, ミカは
+        katakana_context_pattern = re.compile(
+            r'[「『]([ァ-ヺー]{2,4})[」』]|([ァ-ヺー]{2,4})[がはをにの]'
+        )
+        for match in katakana_context_pattern.finditer(text):
+            name = match.group(1) or match.group(2)
+            if name and name not in already_seen:
+                already_seen.add(name)
+                boosted.append(ExtractedName(
+                    surface=name,
+                    reading=self._to_hiragana(name),
+                    pos="人名_推測"
+                ))
+        
+        # Pattern 4: Names with separator (の or ・)
+        # e.g., マルコ・ポーロ -> マルコ, ポーロ
+        separator_pattern = re.compile(r'([ァ-ヺー一-龯]{2,6})[・･]([ァ-ヺー一-龯]{2,6})')
+        for match in separator_pattern.finditer(text):
+            for name in [match.group(1), match.group(2)]:
+                if name not in already_seen:
+                    already_seen.add(name)
+                    boosted.append(ExtractedName(
+                        surface=name,
+                        reading=self._to_hiragana(name) if re.match(r'^[ァ-ヺー]+$', name) else name,
+                        pos="人名_推測"
+                    ))
+        
+        return boosted
     
     def _to_hiragana(self, text: str) -> str:
         """Convert katakana to hiragana for consistent matching."""
@@ -498,3 +579,17 @@ class MeCabExtractor:
         """
         names = self.extract_proper_nouns(text)
         return self.group_aliases(names)
+
+    def get_reading(self, text: str) -> str:
+        """Get hiragana reading for text."""
+        if not self._mecab_available or not self.tagger:
+            return text
+        
+        reading = ""
+        for word in self.tagger(text):
+            try:
+                kana = getattr(word.feature, 'kana', None) or word.surface
+                reading += self._to_hiragana(kana)
+            except AttributeError:
+                reading += word.surface
+        return reading

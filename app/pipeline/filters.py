@@ -78,7 +78,12 @@ class TextFilter:
                  return True
                  
         # Repeated same char (e.g., ざざ, どど)
+        # BUT exempt common dialogue expressions (アアア, イイイ, ハハハ, etc.)
+        # These are valid emphasis/laughter sounds in dialogue
         if len(set(trimmed)) <= 1:
+            dialogue_vowels = {"ア", "イ", "ウ", "エ", "オ", "ハ", "あ", "い", "う", "え", "お", "は"}
+            if trimmed[0] in dialogue_vowels:
+                return False  # Valid dialogue expression
             return True
             
         return False

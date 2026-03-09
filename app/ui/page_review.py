@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict
 from PySide6 import QtCore, QtGui, QtWidgets
-from app.io.project import load_project, save_project
+from app.io.project import default_project_dict, load_project, save_project
 from app.render.renderer import render_translations
 
 
@@ -59,7 +59,6 @@ class PageReviewDialog(QtWidgets.QDialog):
 
     def _setup_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
-        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
         layout.addWidget(split, 10)
 
@@ -155,7 +154,10 @@ class PageReviewDialog(QtWidgets.QDialog):
                 return
             self._json_path = path
         self._apply_table()
-        data = load_project(self._json_path)
+        if os.path.exists(self._json_path):
+            data = load_project(self._json_path)
+        else:
+            data = default_project_dict()
         updated = False
         for page in data.get("pages", []):
             if page.get("image_path") == self._page.get("image_path"):

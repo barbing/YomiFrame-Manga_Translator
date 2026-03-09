@@ -56,10 +56,10 @@ def _worker_main(requests, responses, use_gpu: bool) -> None:
     if not use_gpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         os.environ["TORCH_FORCE_CPU"] = "1"
-    from manga_ocr import MangaOcr
     from PIL import Image as PILImage
+    from app.ocr.manga_ocr_engine import create_manga_ocr_instance
 
-    ocr = MangaOcr(force_cpu=not use_gpu)
+    ocr = create_manga_ocr_instance(use_gpu)
     while True:
         item = requests.get()
         if item is None:

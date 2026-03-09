@@ -41,6 +41,7 @@ class TextBlock(object):
                        accumulate_color = True,
                        default_stroke_width = 0.2,
                        target_lang: str = "",
+                       prob: float = 1.0,  # Add prob argument
                        **kwargs) -> None:
         self.xyxy = [int(num) for num in xyxy]                    # boundingbox of textblock
         self.lines = [] if lines is None else lines     # polygons of textlines
@@ -56,7 +57,7 @@ class TextBlock(object):
         self.weight = weight
 
         self.text = text if text is not None else []
-        self.prob = 1
+        self.prob = prob  # Store the passed probability
 
         self.translation = translation
 
@@ -423,7 +424,7 @@ def group_output(blks, lines, im_w, im_h, mask=None, sort_blklist=True) -> List[
     scattered_lines = {'ver': [], 'hor': []}
     for bbox, cls, conf in zip(*blks):
         # cls could give wrong result
-        blk_list.append(TextBlock(bbox, language=LANG_LIST[cls]))
+        blk_list.append(TextBlock(bbox, language=LANG_LIST[cls], prob=float(conf)))
 
     # step1: filter & assign lines to textblocks
     bbox_score_thresh = 0.4

@@ -45,6 +45,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._refresh_import_preview)
         self._last_preview_dir = ""
+        self._download_thread: QtCore.QThread | None = None
+        self._download_dialog: DownloadDialog | None = None
+        self._download_worker: ModelDownloader | None = None
         self._setup_ui()
         self._connect_signals()
         self._pipeline.status.consistency_issue.connect(self._on_consistency_issue)
@@ -109,6 +112,10 @@ class MainWindow(QtWidgets.QMainWindow):
             missing.append("manga_ocr")
         if not downloader.check_big_lama(models_dir):
             missing.append("big_lama")
+        if not downloader.check_ner(models_dir):
+            missing.append("ner")
+        if not downloader.check_paddle_ocr():
+            missing.append("paddle")
             
         if missing:
             reply = QtWidgets.QMessageBox.warning(
@@ -127,12 +134,17 @@ class MainWindow(QtWidgets.QMainWindow):
         # Normalize input to list
         if isinstance(model_keys, str):
             model_keys = [model_keys]
-            
+        if self._download_thread and self._download_thread.isRunning():
+            self.status_bar.showMessage("A download is already running.", 3000)
+            return
+             
         downloader = ModelDownloader()
         dialog = DownloadDialog(self, title="Downloading Model Assets")
         dialog.set_downloader(downloader)
+        self._download_worker = downloader
+        self._download_dialog = dialog
         
-        self._download_thread = QtCore.QThread()
+        self._download_thread = QtCore.QThread(self)
         
         # Queue tasks BEFORE moving to thread
         models_dir = os.path.join(os.getcwd(), "models")
@@ -147,22 +159,38 @@ class MainWindow(QtWidgets.QMainWindow):
              downloader.prepare_sakura(models_dir)
         if "qwen" in model_keys:
              downloader.prepare_qwen(models_dir)
+        if "ner" in model_keys:
+             downloader.prepare_ner(models_dir)
+        if "paddle" in model_keys:
+             downloader.prepare_paddle(models_dir)
             
         downloader.moveToThread(self._download_thread)
         
         # Connect signal to SLOT (running in new thread context)
         self._download_thread.started.connect(downloader.process_queue)
-        self._download_thread.started.connect(dialog.show) # Show dialog when thread starts
 
         # Cleanup
         downloader.finished.connect(self._download_thread.quit)
         downloader.finished.connect(downloader.deleteLater)
-        self._download_thread.finished.connect(self._download_thread.deleteLater)
+        model_key_for_callback = model_keys[0] if len(model_keys) == 1 else "batch"
         # Handle completion for single items or batch
-        self._download_thread.finished.connect(lambda: self._on_download_complete(model_keys[0] if len(model_keys)==1 else "batch"))
+        self._download_thread.finished.connect(lambda: self._on_download_complete(model_key_for_callback))
+        self._download_thread.finished.connect(self._on_download_thread_finished)
         
         self._download_thread.start()
         dialog.exec()
+        # Ensure worker thread has fully stopped before local dialog refs are released.
+        if self._download_thread and self._download_thread.isRunning():
+            self._download_thread.quit()
+            self._download_thread.wait(5000)
+
+    def _on_download_thread_finished(self) -> None:
+        thread = self._download_thread
+        if thread:
+            thread.deleteLater()
+        self._download_thread = None
+        self._download_worker = None
+        self._download_dialog = None
 
     def _on_download_complete(self, model_key: str):
         """Post-download actions."""
@@ -341,6 +369,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         summary_box = QtWidgets.QGroupBox("Total Progress")
         summary_layout = QtWidgets.QVBoxLayout(summary_box)
+        
+        # Two-stage progress for Pre-Scan mode
+        self.prescan_label = QtWidgets.QLabel("Pre-Scan: Scanning for names...")
+        self.prescan_bar = QtWidgets.QProgressBar()
+        self.prescan_bar.setValue(0)
+        self.prescan_bar.setVisible(False)  # Hidden until prescan starts
+        self.prescan_label.setVisible(False)
+        summary_layout.addWidget(self.prescan_label)
+        summary_layout.addWidget(self.prescan_bar)
+        
         self.progress_title = QtWidgets.QLabel("Total Progress: 0%")
         self.progress_title.setWordWrap(True)
         self.overall_bar = QtWidgets.QProgressBar()
@@ -681,9 +719,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.discovery_model_combo = QtWidgets.QComboBox()
         self.discovery_model_combo.addItems(["auto-detect"])
         
+        # Pre-Scan Mode: Build glossary before translation starts
+        self.prescan_enabled = QtWidgets.QCheckBox("Pre-Scan for Names")
+        self.prescan_enabled.setToolTip(
+            "Scan all pages for character names BEFORE translation starts.\n"
+            "This builds a complete glossary upfront, ensuring consistent names\n"
+            "across all pages without needing re-translation."
+        )
+        self.prescan_enabled.setChecked(False)
+        
         layout.addRow("", self.style_edit)
         layout.addRow("", self.auto_glossary)
         layout.addRow("", self.use_ollama_discovery)
+        layout.addRow("", self.prescan_enabled)
         return group
 
     def _group_models_main(self) -> QtWidgets.QGroupBox:
@@ -1526,7 +1574,19 @@ class MainWindow(QtWidgets.QMainWindow):
             path = self.settings_gguf_model_path.currentData()
             if not isinstance(path, str) or not path:
                 path = self.settings_gguf_model_path.currentText().strip()
-            self.settings_trans_warning.setVisible(not path or not os.path.isfile(path))
+            if not path or not os.path.isfile(path):
+                self.settings_trans_warning.setText(
+                    "⚠️ GGUF model not found. Browse a valid .gguf file or place it under models/."
+                )
+                self.settings_trans_warning.setVisible(True)
+            elif not self._gguf_runtime_available():
+                self.settings_trans_warning.setText(
+                    "⚠️ llama-cpp-python is not available in this environment. "
+                    "Install it or switch Translator backend to Ollama."
+                )
+                self.settings_trans_warning.setVisible(True)
+            else:
+                self.settings_trans_warning.setVisible(False)
         self.settings_trans_ollama_warning.setVisible(False)
         if backend == "Ollama":
             self.settings_trans_ollama_warning.setVisible(not self._ollama_available())
@@ -1537,7 +1597,19 @@ class MainWindow(QtWidgets.QMainWindow):
             path = self.settings_discovery_gguf_path.currentData()
             if not isinstance(path, str) or not path:
                 path = self.settings_discovery_gguf_path.currentText().strip()
-            self.settings_scan_gguf_warning.setVisible(not path or not os.path.isfile(path))
+            if not path or not os.path.isfile(path):
+                self.settings_scan_gguf_warning.setText(
+                    "⚠️ GGUF model not found. Browse a valid .gguf file or place it under models/."
+                )
+                self.settings_scan_gguf_warning.setVisible(True)
+            elif not self._gguf_runtime_available():
+                self.settings_scan_gguf_warning.setText(
+                    "⚠️ llama-cpp-python is not available in this environment. "
+                    "Install it or switch Deep Scan backend to Ollama."
+                )
+                self.settings_scan_gguf_warning.setVisible(True)
+            else:
+                self.settings_scan_gguf_warning.setVisible(False)
         else:
             self.settings_scan_gguf_warning.setVisible(False)
         self.settings_scan_ollama_warning.setVisible(False)
@@ -1550,6 +1622,28 @@ class MainWindow(QtWidgets.QMainWindow):
             return OllamaClient().is_available(timeout=1)
         except Exception:
             return False
+
+    def _gguf_runtime_available(self) -> bool:
+        try:
+            import llama_cpp  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def _validate_translation_backend(self, settings: PipelineSettings) -> str:
+        if settings.translator_backend != "GGUF":
+            return ""
+        gguf_path = (settings.gguf_model_path or "").strip()
+        if not gguf_path:
+            return "GGUF backend selected, but no GGUF model path is set."
+        if not os.path.isfile(gguf_path):
+            return f"GGUF backend selected, but model file was not found: {gguf_path}"
+        if not self._gguf_runtime_available():
+            return (
+                "GGUF backend selected, but llama-cpp-python is not available in this environment. "
+                "Install it with 'pip install llama-cpp-python' or switch Translator backend to Ollama."
+            )
+        return ""
 
     def _settings_selected_gguf(self) -> str:
         data = self.settings_gguf_model_path.currentData()
@@ -1632,6 +1726,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pipeline.status.queue_reset.connect(self._set_queue)
         self._pipeline.status.queue_item.connect(self._update_queue_item)
         self._pipeline.status.page_ready.connect(self._on_page_ready)
+        # Two-Pass Pipeline: prescan progress signals
+        self._pipeline.status.prescan_started.connect(self._on_prescan_started)
+        self._pipeline.status.prescan_progress.connect(self._on_prescan_progress)
+        self._pipeline.status.prescan_finished.connect(self._on_prescan_finished)
         self.queue_list.itemDoubleClicked.connect(self._open_page_review)
         self.queue_list.verticalScrollBar().valueChanged.connect(self._update_visible_thumbnails)
         self.import_dir.textChanged.connect(self._schedule_import_preview)
@@ -1893,6 +1991,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_page_time(self, text: str) -> None:
         self.page_time_label.setText(text)
+
+    def _on_prescan_started(self) -> None:
+        """Show prescan progress bar when pre-scan begins."""
+        self.prescan_label.setVisible(True)
+        self.prescan_bar.setVisible(True)
+        self.prescan_bar.setValue(0)
+        self.prescan_label.setText("Pre-Scan: Scanning for names...")
+        self.progress_title.setText("Translation: Waiting for pre-scan...")
+        self.overall_bar.setValue(0)
+
+    def _on_prescan_progress(self, value: int) -> None:
+        """Update prescan progress bar."""
+        self.prescan_bar.setValue(value)
+        self.prescan_label.setText(f"Pre-Scan: {value}%")
+
+    def _on_prescan_finished(self) -> None:
+        """Hide prescan progress bar and enable translation progress."""
+        self.prescan_bar.setValue(100)
+        self.prescan_label.setText("Pre-Scan: Complete ✓")
+        self.progress_title.setText("Translation: Starting...")
 
     def _set_queue(self, items: list) -> None:
         self.queue_list.clear()
@@ -2379,6 +2497,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ollama_context=ollama_context,
             gguf_temperature=gguf_temperature,
             gguf_top_p=gguf_top_p,
+            prescan_enabled=self.prescan_enabled.isChecked(),
         )
 
     def _start_pipeline(self, whitelist: list[str] = None) -> bool:
@@ -2392,6 +2511,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.import_dir.setText(path)
         
         settings = self._get_pipeline_settings(whitelist)
+        backend_error = self._validate_translation_backend(settings)
+        if backend_error:
+            self.status_bar.showMessage(backend_error, 8000)
+            if self.log_view:
+                self.log_view.appendPlainText(backend_error)
+            QtWidgets.QMessageBox.warning(self, "Translator Backend Error", backend_error)
+            return False
         self._pipeline.start(settings)
         return True
 
@@ -2423,7 +2549,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     _, ext = os.path.splitext(entry)
                     if ext.lower() in allowed:
                         names.append(entry)
-                names.sort()
+                names.sort(key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)])
                 for idx in pages:
                     if idx < len(names):
                         filenames.append(names[idx])
@@ -2583,6 +2709,7 @@ class MainWindow(QtWidgets.QMainWindow):
         settings.setValue("use_gpu", self.use_gpu.isChecked())
         settings.setValue("fast_mode", self.fast_mode.isChecked())
         settings.setValue("auto_glossary", self.auto_glossary.isChecked())
+        settings.setValue("prescan_enabled", self.prescan_enabled.isChecked())
         settings.setValue("font_name", self.font_name.currentText())
         
         # GGUF
@@ -2653,6 +2780,7 @@ class MainWindow(QtWidgets.QMainWindow):
         _restore(self.use_gpu, "use_gpu", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
         _restore(self.fast_mode, "fast_mode", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
         _restore(self.auto_glossary, "auto_glossary", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
+        _restore(self.prescan_enabled, "prescan_enabled", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
         _restore(self.font_name, "font_name")
         _restore(self.gguf_n_gpu_layers, "gguf_n_gpu_layers", type_func=int)
         

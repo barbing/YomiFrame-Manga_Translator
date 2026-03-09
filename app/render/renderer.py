@@ -226,6 +226,21 @@ def render_translations(
                         best_lines = test_lines
                         best_height = test_height
                         break
+            
+            # Efficient width overflow check (runs once, not in every loop)
+            # If any line is wider than the box, shrink font until it fits
+            max_line_width = max((draw.textlength(line, font=best_font) for line in best_lines), default=0)
+            if max_line_width > w * 1.05:  # 5% tolerance
+                current_size = best_font.size if hasattr(best_font, 'size') else 12
+                for shrink_size in range(current_size - 1, 9, -1):
+                    shrink_font = _load_font(_find_font_path(region_font), shrink_size, _sample_char(text))
+                    shrink_lines = _wrap_text(draw, text, shrink_font, w)
+                    shrink_max_w = max((draw.textlength(ln, font=shrink_font) for ln in shrink_lines), default=0)
+                    if shrink_max_w <= w * 1.05:
+                        best_font = shrink_font
+                        best_lines = shrink_lines
+                        break
+            
             if forced_color:
                 fill_color = forced_color
             else:
@@ -583,6 +598,23 @@ def _apply_bubble_fill(image, bubble_mask, text_mask, reference_np):
 def _apply_white_mask(image, text_mask):
     if cv2 is None or np is None:
         draw = ImageDraw.Draw(image)
+        try:
+            h = len(text_mask)
+            w = len(text_mask[0]) if h else 0
+        except Exception:
+            return image
+        if h <= 0 or w <= 0:
+            return image
+        # PIL-only fallback: fill every masked pixel so text is removed even without cv2/numpy.
+        px = image.load()
+        for y in range(min(h, image.height)):
+            row = text_mask[y]
+            for x in range(min(w, image.width)):
+                try:
+                    if int(row[x]) > 0:
+                        px[x, y] = (255, 255, 255)
+                except Exception:
+                    continue
         return image
     img_np = np.array(image)
     # Aggressively dilate mask to ensure complete text coverage

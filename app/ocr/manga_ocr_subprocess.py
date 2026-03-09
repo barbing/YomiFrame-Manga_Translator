@@ -35,14 +35,16 @@ class MangaOcrSubprocess:
 
 def _run_ocr(python_executable: str, image_path: str, use_gpu: bool) -> str:
     env = os.environ.copy()
+    app_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    env["PYTHONPATH"] = f"{app_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
     if not use_gpu:
         env["CUDA_VISIBLE_DEVICES"] = ""
         env["TORCH_FORCE_CPU"] = "1"
     code = (
-        "from manga_ocr import MangaOcr;"
+        "from app.ocr.manga_ocr_engine import create_manga_ocr_instance;"
         "from PIL import Image;"
         "import sys;"
-        f"ocr=MangaOcr(force_cpu={str(not use_gpu)});"
+        f"ocr=create_manga_ocr_instance({str(use_gpu)});"
         "img=Image.open(sys.argv[1]);"
         "print(ocr(img))"
     )

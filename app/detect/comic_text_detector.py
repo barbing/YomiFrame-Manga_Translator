@@ -22,11 +22,25 @@ def _default_model_dir() -> str:
 
 
 def _select_model_path(model_dir: str, use_gpu: bool) -> str:
+    # This model is user-downloaded and resides in the models/ folder.
+    # We do NOT check system paths to avoid conflict.
+    
+    # 1. Portable Model Check
+    portable_model_root = None
+    local_model_path = os.path.join(os.getcwd(), "models", "comic-text-detector")
+    if os.path.exists(os.path.join(local_model_path, "comictextdetector.pt")):
+        portable_model_root = local_model_path
+
+    # Determine effective root (Allow override, then portable, then default arg)
+    effective_model_root = portable_model_root or model_dir
+
     override = os.environ.get("MT_COMICTEXT_MODEL_PATH", "").strip()
     if override:
         return override
-    onnx_path = os.path.join(model_dir, "comictextdetector.pt.onnx")
-    pt_path = os.path.join(model_dir, "comictextdetector.pt")
+
+    onnx_path = os.path.join(effective_model_root, "comictextdetector.pt.onnx")
+    pt_path = os.path.join(effective_model_root, "comictextdetector.pt")
+
     if use_gpu and os.path.isfile(pt_path):
         logger.info(f"Selected GPU model: {pt_path}")
         return pt_path
@@ -106,8 +120,24 @@ class ComicTextDetector:
             input_size=input_size,
             device=device,
             act="leaky",
+            conf_thresh=0.5,
+            nms_thresh=0.4,
         )
         logger.info(f"ComicTextDetector initialized. GPU={use_gpu}, Device={device}")
+
+    def unload(self) -> None:
+        """Unload model and free VRAM."""
+        if hasattr(self, "_detector"):
+            del self._detector
+        
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+        except Exception:
+            pass
 
     def detect(self, image_path: str, input_size: int = 1024) -> List[Tuple[List[List[float]], float]]:
         image = _read_image(image_path)
@@ -129,13 +159,16 @@ class ComicTextDetector:
         )
         output: List[Tuple[List[List[float]], float]] = []
         for blk in blk_list:
+            # Use real probability from detector (default to 1.0 if missing)
+            score = getattr(blk, "prob", 1.0)
+            
             line_box = _lines_bounds(getattr(blk, "lines", []) or [])
             if line_box:
-                output.append((_bbox_to_polygon(line_box), 1.0))
+                output.append((_bbox_to_polygon(line_box), score))
                 continue
             xyxy = getattr(blk, "xyxy", None)
             if xyxy:
-                output.append((_bbox_to_polygon(xyxy), 1.0))
+                output.append((_bbox_to_polygon(xyxy), score))
         return output
 
 

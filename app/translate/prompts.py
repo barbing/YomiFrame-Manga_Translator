@@ -153,6 +153,7 @@ def _format_characters(items: List[object]) -> str:
             part += f" ({gender})"
         if info:
             part += f": {info}"
+            
         lines.append(part)
     return "; ".join(lines)
 
