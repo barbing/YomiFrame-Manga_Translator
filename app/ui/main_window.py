@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Manga Translator Pro v1.2.0")
+        self.setWindowTitle("YomiFrame v1.2.0")
         self.resize(1200, 720)
         logger.info("MainWindow initialized")
         
@@ -114,7 +114,7 @@ class MainWindow(QtWidgets.QMainWindow):
             missing.append("big_lama")
         if not downloader.check_ner(models_dir):
             missing.append("ner")
-        if not downloader.check_paddle_ocr():
+        if not downloader.check_paddle_ocr(models_dir):
             missing.append("paddle")
             
         if missing:
@@ -254,7 +254,7 @@ class MainWindow(QtWidgets.QMainWindow):
         brand_icon.setAlignment(QtCore.Qt.AlignCenter)
         brand_icon.setFixedSize(34, 34)
         brand_icon.setStyleSheet("QLabel { background-color: #1b2230; border-radius: 10px; font-size: 18px; }")
-        brand_title = QtWidgets.QLabel("MT Pro")
+        brand_title = QtWidgets.QLabel("YomiFrame")
         brand_title.setStyleSheet("QLabel { font-size: 18px; font-weight: 600; }")
         if icons.get("brand"):
             brand_icon.setPixmap(icons["brand"].pixmap(18, 18))
@@ -704,11 +704,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.style_browse = QtWidgets.QPushButton("Browse")
         self.style_edit = QtWidgets.QPushButton("Open Editor")
         layout.addRow("Guide JSON", self._hbox(self.style_path, self.style_browse))
-        self.auto_glossary = QtWidgets.QCheckBox("Auto glossary\n(consistent terms)")
+        self.auto_glossary = QtWidgets.QCheckBox("Auto-Glossary\n(Name Memory)")
         self.auto_glossary.setChecked(self._defaults.auto_glossary)
         self.auto_glossary.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-        self.use_ollama_discovery = QtWidgets.QCheckBox("Hybrid Discovery (LLM)")
-        self.use_ollama_discovery.setToolTip("Allow using LLM (Qwen) for background name discovery even if translating with GGUF.\nRequires Ollama installed and running parallel to GGUF.")
+        self.auto_glossary.setToolTip(
+            "Build and apply a name/term memory during translation.\n"
+            "This is the main switch for consistent proper nouns and alias handling."
+        )
+        self.use_ollama_discovery = QtWidgets.QCheckBox("Experimental Deep Discovery\n(Optional, slower)")
+        self.use_ollama_discovery.setToolTip(
+            "Experimental accuracy boost for difficult discovery cases.\n"
+            "Uses an additional LLM path for background name/entity discovery.\n"
+            "Leave this off for the normal fast local workflow."
+        )
         self.use_ollama_discovery.setChecked(False) # Default off for safety/performance
         
         self.mismatch_warning_label = QtWidgets.QLabel("⚠️ Performance Warning: Using different models causes slow reloading.")
@@ -720,11 +728,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.discovery_model_combo.addItems(["auto-detect"])
         
         # Pre-Scan Mode: Build glossary before translation starts
-        self.prescan_enabled = QtWidgets.QCheckBox("Pre-Scan for Names")
+        self.prescan_enabled = QtWidgets.QCheckBox("Build Glossary Before Translation")
         self.prescan_enabled.setToolTip(
-            "Scan all pages for character names BEFORE translation starts.\n"
-            "This builds a complete glossary upfront, ensuring consistent names\n"
-            "across all pages without needing re-translation."
+            "Scan the chapter/volume before translation starts and build the glossary upfront.\n"
+            "Recommended for volumes and best proper-noun consistency."
         )
         self.prescan_enabled.setChecked(False)
         
@@ -888,11 +895,18 @@ class MainWindow(QtWidgets.QMainWindow):
         
         main_layout.addWidget(grp_trans)
 
-        # 3. Deep Scan (Glossary) Settings
+        # 3. Experimental Deep Scan (Glossary) Settings
         # =================================================
-        grp_scan = QtWidgets.QGroupBox("Deep Scan (Background Analysis)")
+        grp_scan = QtWidgets.QGroupBox("Experimental Deep Scan")
         l_scan = QtWidgets.QGridLayout(grp_scan)
         l_scan.setColumnStretch(1, 1)
+
+        self.settings_scan_note = QtWidgets.QLabel(
+            "Experimental feature. Keep this off for the normal Auto-Glossary workflow."
+        )
+        self.settings_scan_note.setStyleSheet("color: #94a3b8; font-size: 10px;")
+        self.settings_scan_note.setWordWrap(True)
+        l_scan.addWidget(self.settings_scan_note, 0, 0, 1, 2)
         
         self.settings_discovery_backend = QtWidgets.QComboBox()
         self.settings_discovery_backend.addItems(["Ollama", "GGUF"])
@@ -915,16 +929,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings_mismatch_warning.setVisible(False)
         self.settings_mismatch_warning.setWordWrap(True)
 
-        l_scan.addWidget(QtWidgets.QLabel("Backend"), 0, 0)
-        l_scan.addWidget(self.settings_discovery_backend, 0, 1)
+        l_scan.addWidget(QtWidgets.QLabel("Backend"), 1, 0)
+        l_scan.addWidget(self.settings_discovery_backend, 1, 1)
         
-        l_scan.addWidget(QtWidgets.QLabel("Ollama Model"), 1, 0)
-        l_scan.addWidget(self.settings_discovery_ollama_model, 1, 1)
+        l_scan.addWidget(QtWidgets.QLabel("Ollama Model"), 2, 0)
+        l_scan.addWidget(self.settings_discovery_ollama_model, 2, 1)
         
-        l_scan.addWidget(QtWidgets.QLabel("GGUF Model"), 2, 0)
-        l_scan.addWidget(self._hbox(self.settings_discovery_gguf_path, self.settings_discovery_gguf_browse, self.settings_dl_qwen), 2, 1)
+        l_scan.addWidget(QtWidgets.QLabel("GGUF Model"), 3, 0)
+        l_scan.addWidget(self._hbox(self.settings_discovery_gguf_path, self.settings_discovery_gguf_browse, self.settings_dl_qwen), 3, 1)
         
-        l_scan.addWidget(self.settings_mismatch_warning, 3, 1)
+        l_scan.addWidget(self.settings_mismatch_warning, 4, 1)
 
         self.settings_scan_gguf_warning = QtWidgets.QLabel(
             "⚠️ GGUF model not found. Browse a valid .gguf file or place it under models/."
@@ -932,7 +946,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings_scan_gguf_warning.setStyleSheet("color: #ef4444; font-size: 10px; font-weight: 600;")
         self.settings_scan_gguf_warning.setVisible(False)
         self.settings_scan_gguf_warning.setWordWrap(True)
-        l_scan.addWidget(self.settings_scan_gguf_warning, 4, 1)
+        l_scan.addWidget(self.settings_scan_gguf_warning, 5, 1)
 
         self.settings_scan_ollama_warning = QtWidgets.QLabel(
             "⚠️ Ollama server not available. Install Ollama and run 'ollama serve'."
@@ -940,7 +954,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings_scan_ollama_warning.setStyleSheet("color: #ef4444; font-size: 10px; font-weight: 600;")
         self.settings_scan_ollama_warning.setVisible(False)
         self.settings_scan_ollama_warning.setWordWrap(True)
-        l_scan.addWidget(self.settings_scan_ollama_warning, 5, 1)
+        l_scan.addWidget(self.settings_scan_ollama_warning, 6, 1)
         
         main_layout.addWidget(grp_scan)
 
@@ -1675,6 +1689,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings_ollama_model.currentTextChanged.connect(self._check_model_mismatch)
         self.settings_translator_backend.currentTextChanged.connect(self._check_model_mismatch)
         self.use_ollama_discovery.toggled.connect(self._check_model_mismatch)
+        self.auto_glossary.toggled.connect(self._update_glossary_controls)
         self.settings_translator_backend.currentTextChanged.connect(self._update_translation_warning)
         self.settings_gguf_model_path.currentTextChanged.connect(self._update_translation_warning)
         self.settings_discovery_backend.currentTextChanged.connect(self._update_scan_warnings)
@@ -2249,6 +2264,44 @@ class MainWindow(QtWidgets.QMainWindow):
         # Mismatch detected!
         self.settings_mismatch_warning.setVisible(True)
 
+    def _update_glossary_controls(self) -> None:
+        enabled = self.auto_glossary.isChecked()
+        if not enabled:
+            self.prescan_enabled.blockSignals(True)
+            self.use_ollama_discovery.blockSignals(True)
+            self.prescan_enabled.setChecked(False)
+            self.use_ollama_discovery.setChecked(False)
+            self.prescan_enabled.blockSignals(False)
+            self.use_ollama_discovery.blockSignals(False)
+
+        self.prescan_enabled.setEnabled(enabled)
+        self.use_ollama_discovery.setEnabled(enabled)
+
+        if enabled:
+            self.prescan_enabled.setToolTip(
+                "Scan the chapter/volume before translation starts and build the glossary upfront.\n"
+                "Recommended for volumes and best proper-noun consistency."
+            )
+            self.use_ollama_discovery.setToolTip(
+                "Optional accuracy boost for difficult discovery cases.\n"
+                "Uses an additional LLM path for background name/entity discovery.\n"
+                "Leave this off for the normal fast local workflow."
+            )
+        else:
+            disabled_note = "\nDisabled until Auto-Glossary / Name Memory is enabled."
+            self.prescan_enabled.setToolTip(
+                "Scan the chapter/volume before translation starts and build the glossary upfront.\n"
+                "Recommended for volumes and best proper-noun consistency."
+                + disabled_note
+            )
+            self.use_ollama_discovery.setToolTip(
+                "Optional accuracy boost for difficult discovery cases.\n"
+                "Uses an additional LLM path for background name/entity discovery.\n"
+                "Leave this off for the normal fast local workflow."
+                + disabled_note
+            )
+        self._check_model_mismatch()
+
     def _on_page_ready(self, index: int, page_record: dict) -> None:
         self._page_cache[index] = page_record
         item = self.queue_list.item(index)
@@ -2709,6 +2762,7 @@ class MainWindow(QtWidgets.QMainWindow):
         settings.setValue("use_gpu", self.use_gpu.isChecked())
         settings.setValue("fast_mode", self.fast_mode.isChecked())
         settings.setValue("auto_glossary", self.auto_glossary.isChecked())
+        settings.setValue("use_ollama_discovery", self.use_ollama_discovery.isChecked())
         settings.setValue("prescan_enabled", self.prescan_enabled.isChecked())
         settings.setValue("font_name", self.font_name.currentText())
         
@@ -2780,6 +2834,7 @@ class MainWindow(QtWidgets.QMainWindow):
         _restore(self.use_gpu, "use_gpu", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
         _restore(self.fast_mode, "fast_mode", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
         _restore(self.auto_glossary, "auto_glossary", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
+        _restore(self.use_ollama_discovery, "use_ollama_discovery", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
         _restore(self.prescan_enabled, "prescan_enabled", type_func=lambda x: x == "true" if isinstance(x, str) else bool(x))
         _restore(self.font_name, "font_name")
         _restore(self.gguf_n_gpu_layers, "gguf_n_gpu_layers", type_func=int)
@@ -2810,6 +2865,7 @@ class MainWindow(QtWidgets.QMainWindow):
             
         self._sync_models_to_settings()
         self._sync_paths_to_settings()
+        self._update_glossary_controls()
         self._update_discovery_ui()
         self._update_translation_warning()
         self._update_scan_warnings()

@@ -3,10 +3,53 @@
 from __future__ import annotations
 import requests
 from typing import Optional
+import json
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_glossary_response(text: str) -> dict[str, str]:
+    clean_response = str(text or "").strip()
+    if not clean_response:
+        return {}
+    if "```json" in clean_response:
+        clean_response = clean_response.split("```json", 1)[1].split("```", 1)[0]
+    elif "```" in clean_response:
+        clean_response = clean_response.split("```", 1)[1].split("```", 1)[0]
+
+    try:
+        parsed = json.loads(clean_response)
+        if isinstance(parsed, dict):
+            return {str(k).strip(): str(v).strip() for k, v in parsed.items()}
+    except json.JSONDecodeError:
+        pass
+
+    start = clean_response.find("{")
+    end = clean_response.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = clean_response[start : end + 1]
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return {str(k).strip(): str(v).strip() for k, v in parsed.items()}
+        except json.JSONDecodeError:
+            pass
+
+    merged = {}
+    for line in clean_response.splitlines():
+        line = line.strip().rstrip(",")
+        if not line or not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            for key, value in parsed.items():
+                merged[str(key).strip()] = str(value).strip()
+    return merged
 
 class OllamaClient:
     def __init__(self, base_url: str = "http://localhost:11434") -> None:
@@ -85,22 +128,12 @@ class OllamaClient:
                     prompt=prompt_text,
                     options={"num_predict": 1024, "temperature": 0.1}
                 )
-                
-                # Parse JSON
-                clean_response = response
-                if "```json" in clean_response:
-                    clean_response = clean_response.split("```json")[1].split("```")[0]
-                elif "```" in clean_response:
-                    clean_response = clean_response.split("```")[1].split("```")[0]
-                    
-                import json
-                try:
-                    chunk_map = json.loads(clean_response)
-                    if isinstance(chunk_map, dict):
-                        results.update(chunk_map)
-                except json.JSONDecodeError:
-                    logger.warning(f"Failed to parse glossary JSON (Ollama): {clean_response[:50]}...")
-                    pass
+
+                chunk_map = _parse_glossary_response(response)
+                if chunk_map:
+                    results.update(chunk_map)
+                else:
+                    logger.warning(f"Failed to parse glossary JSON (Ollama): {str(response)[:50]}...")
             except Exception as e:
                 logger.error(f"Error translating glossary chunk (Ollama): {e}")
                 

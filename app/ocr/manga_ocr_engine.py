@@ -5,6 +5,7 @@ import os
 import sys
 import ctypes
 from pathlib import Path
+from app.models.resolution import resolve_manga_ocr_local_dir, resolve_manga_ocr_system_ref
 
 
 def _add_dll_search_paths() -> None:
@@ -42,22 +43,7 @@ def _preload_torch_dlls() -> None:
 
 def resolve_manga_ocr_model_ref() -> str | None:
     """Resolve the best MangaOCR model reference: system cache, local path, or None."""
-    try:
-        hf_home = os.environ.get("HF_HOME")
-        if not hf_home:
-            hf_home = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
-        cache_path = os.path.join(hf_home, "hub", "models--kha-white--manga-ocr-base")
-        snapshots = os.path.join(cache_path, "snapshots")
-        if os.path.exists(snapshots) and os.listdir(snapshots):
-            return "kha-white/manga-ocr-base"
-    except Exception:
-        pass
-
-    app_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    model_path = os.path.join(app_root, "models", "manga-ocr")
-    if os.path.exists(os.path.join(model_path, "pytorch_model.bin")):
-        return model_path
-    return None
+    return resolve_manga_ocr_system_ref() or resolve_manga_ocr_local_dir()
 
 
 def create_manga_ocr_instance(use_gpu: bool):

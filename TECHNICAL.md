@@ -1,241 +1,314 @@
-# Manga Translator Pro - Technical Notes (v1.0.0)
+# YomiFrame - Technical Notes (v1.2.0)
 
 ## Overview
-Manga Translator Pro is a Windows desktop app for batch manga translation. It detects text regions,
-OCRs the Japanese, translates to the target language, removes the original text, and renders
-translated text back into the page. The app stores results in a project JSON file and outputs
-translated images to the user-selected export folder.
-When Auto-Glossary is enabled, it also builds a `style_guide.json` for consistent noun translation.
+YomiFrame is a Windows desktop application for local manga translation. The pipeline detects text regions, OCRs Japanese text, translates it with a local backend, removes the original text, and renders translated text back into the page.
 
-## Architecture
-- UI: PySide6 (Qt) dashboard with Home/Queue/Library/Settings pages.
-- Pipeline: `PipelineController` orchestrates detect -> OCR -> translate -> render.
-- Models:
-  - Text detection: ComicTextDetector (optional)
-  - OCR: MangaOCR / PaddleOCR
-  - Translation: Ollama or GGUF via llama-cpp-python
-  - Inpainting: fast (OpenCV) or AI inpainting (LaMa - Large Mask Inpainting)
-  - Auto-Glossary: MeCab (fugashi) with optional LLM Hybrid Discovery
-  - Deep Scan: separate backend/model for extraction-focused analysis
+The current system is built around four principles:
+- `ComicTextDetector` is the primary detector
+- local inference should remain fast enough for volume translation
+- proper nouns need cross-page memory, not only per-page prompt hints
+- startup should pre-download fixed runtime assets before the first real translation run
 
-Key modules:
-- `app/pipeline/controller.py` - pipeline orchestration, batching, caching
-- `app/nlp/mecab_extractor.py` - MeCab proper noun extraction and alias grouping
-- `app/render/renderer.py` - text removal and text rendering
-- `app/detect/*` - text detection backends
-- `app/ocr/*` - OCR backends
-- `app/translate/*` - translators (Ollama, GGUF)
-- `app/ui/*` - UI layout, theme, and dialogs
+Outputs:
+- translated images
+- `project.json`
+- `style_guide.json` when Auto-Glossary is enabled
 
-## Code Structure (with explanations)
-- `app/main.py`
-  - App entry point. Creates the Qt application, applies theme, and launches `MainWindow`.
-- `app/ui/main_window.py`
-  - Main UI layout and navigation (Home/Queue/Library/Settings).
-  - Wires UI events to pipeline actions.
-  - Manages thumbnails, live inspection panel, and queue table updates.
-- `app/ui/theme.py`
-  - Dark/light palette and stylesheet definitions used by the UI.
-- `app/ui/page_review.py` and `app/ui/region_review.py`
-  - Review dialogs for side-by-side page inspection and per-region edits.
-- `app/pipeline/controller.py`
-  - Orchestrates the translation pipeline:
-    - Loads pages, dispatches detection, OCR, translation, rendering.
-    - Tracks per-page timing, progress, and errors.
-    - Emits UI-friendly status updates.
-- `app/detect/*`
-  - Text detector backends (e.g., comic text detector).
-  - Each detector returns regions with bounding boxes/polygons.
-- `app/ocr/*`
-  - OCR backends (MangaOCR / PaddleOCR).
-  - Returns OCR text per region with confidence.
-- `app/translate/*`
-  - Translators (Ollama or GGUF/llama-cpp).
-  - Handles batching and prompt formatting.
-- `app/render/renderer.py`
-  - Renders translated text into the original image.
-  - Handles bubble/background cleaning and text placement.
-  - Applies color selection and stroke for contrast.
-- `app/io/project.py`
-  - Reads/writes project JSON files.
-  - Used by the pipeline and review dialogs.
+## High-Level Architecture
+- UI: `PySide6`
+- Pipeline orchestration: `app/pipeline/controller.py`
+- Pre-scan and glossary building: `app/pipeline/prescan.py`
+- Detection: `app/detect/*`
+- OCR: `app/ocr/*`
+- Translation: `app/translate/*`
+- Rendering and text cleanup: `app/render/renderer.py`
+- NLP / name extraction / alias graph: `app/nlp/*`
+- Model download and resolution: `app/models/*`
 
-## Pipeline Flow (per page)
-1. Load image (optionally downscale for detection only).
-2. Detect text regions (speech bubbles + background text).
-3. OCR each region (crop-based).
-4. Translate unique OCR strings (batched).
-5. Render:
-   - Remove original text (bubble fill or inpaint).
-   - For background text, fill a local color patch to avoid mosaic artifacts.
-   - Place translated text in region bounds.
-6. Save output image and update project JSON.
+## Main Runtime Flow
+The main runtime flow lives in [controller.py](app/pipeline/controller.py).
 
-### Pipeline - Detailed Walkthrough
-This section describes how the pipeline moves data through the system and where each step
-is implemented in code.
+Per page:
+1. Load image.
+2. Detect text regions.
+3. OCR text regions.
+4. Classify/filter regions.
+5. Apply glossary and context-aware translation.
+6. Remove original text.
+7. Render translated text.
+8. Save page output and update `project.json`.
 
-1) **Image load & normalization**
-   - The controller reads each image path and loads it for processing.
-   - Detection can run on a resized version for speed, but rendering uses the full-res image.
-   - Goal: speed without losing output quality.
+The pipeline also emits UI-facing status messages, progress, ETA, and per-page timing.
 
-2) **Text detection**
-   - A detector backend (e.g., ComicTextDetector) returns region proposals.
-   - Each region contains a bbox and polygon, used later for OCR and rendering.
-   - The controller stores these regions in the per-page project structure.
+## Detection
+Primary detector:
+- `ComicTextDetector`
 
-3) **OCR**
-   - Each region is cropped and passed to the selected OCR engine.
-   - The OCR output is attached to the region as `ocr_text` with `confidence.ocr`.
-   - If OCR fails, the region is flagged and the UI log shows the error.
+Fallback detector:
+- `PaddleTextDetector`
 
-4) **Translation**
-   - The controller de-duplicates OCR strings and batches them for translation.
-   - The translator backend returns translated strings, which are re-applied to regions.
-   - Translation is cached to avoid repeated calls for identical text.
-   - Auto-Glossary runs in parallel (MeCab-only by default), and can optionally use
-     Hybrid Discovery (LLM) for deeper extraction.
+Design intent:
+- `ComicTextDetector` should be the normal path
+- `PaddleTextDetector` exists only as an emergency fallback when CTD is unavailable or crashes
 
-5) **Rendering**
-   - Rendering uses the region bbox/polygon and translation text.
-   - Speech bubbles:
-     - Prefer a clean fill for solid bubbles, then draw translated text.
-   - Background text:
-     - Fill with sampled local color to avoid mosaic artifacts.
-     - Force text color (white on dark backgrounds, black on light backgrounds).
-   - Text layout uses region size to estimate font size and line breaks.
+Recent validation work focused on keeping the CTD path stable and avoiding silent degradation into Paddle-only behavior.
 
-6) **Output**
-   - The translated image is saved to the export folder.
-   - The updated project JSON is saved with render settings and confidence scores.
-   - Auto-Glossary saves `style_guide.json` to the export folder.
-   - A consistency check can flag early pages that predate the final glossary.
+## OCR
+Primary OCR path:
+- `MangaOCR`
+
+Fallback and rescue path:
+- `PaddleOCR`
+
+Runtime behavior:
+- the app first tries in-process `MangaOCR`
+- if that fails, it can use a worker-process fallback
+- if MangaOCR is unavailable, it falls back to `PaddleOCR`
+- for certain weak or wide OCR cases, Paddle can be used as a targeted rescue comparison instead of replacing MangaOCR globally
+
+Relevant files:
+- [manga_ocr_engine.py](app/ocr/manga_ocr_engine.py)
+- [manga_ocr_worker.py](app/ocr/manga_ocr_worker.py)
+- [manga_ocr_subprocess.py](app/ocr/manga_ocr_subprocess.py)
+- [paddle_ocr_recognizer.py](app/ocr/paddle_ocr_recognizer.py)
+
+## Translation Backends
+Supported translation backends:
+- `Ollama`
+- `GGUF` via `llama-cpp-python`
+
+Important product assumption:
+- Sakura is treated as a translation model first, not a general extraction model
+
+That means the noun-consistency system is designed to do most discovery with OCR + MeCab + graph logic first, then use the translation model for translation tasks rather than full extraction.
+
+Relevant files:
+- [ollama_client.py](app/translate/ollama_client.py)
+- [gguf_client.py](app/translate/gguf_client.py)
+- [prompts.py](app/translate/prompts.py)
+
+## Auto-Glossary / Name Memory
+The current glossary system is no longer just “consistent terms.” It is a lightweight name-memory layer.
+
+Core components:
+- [mecab_extractor.py](app/nlp/mecab_extractor.py)
+- [character_graph.py](app/nlp/character_graph.py)
+- [prescan.py](app/pipeline/prescan.py)
+
+Current behavior:
+- extracts likely names and aliases from OCR text
+- groups aliases into canonical character/entity nodes
+- prefers kanji canonical names when available
+- handles many kana nickname variants more conservatively and more consistently
+- exports cleaner `style_guide.json` entries
+
+Examples of the kinds of relationships it now handles better:
+- full name -> shortened surname
+- given-name call forms
+- honorific variants
+- kana nicknames like `まゆ`, `まゆっち`, `まゆまゆ`
+
+Known limitation:
+- if the corpus never contains a canonical reference and only contains kana aliases, the system cannot reliably reconstruct the original kanji name from kana alone
+- if a prior `style_guide.json` exists, it can supply that missing mapping
+
+## Pre-Scan
+`Build Glossary Before Translation` is the recommended quality mode for chapters and volumes.
+
+Purpose:
+- scan OCR text before page translation
+- build glossary/name memory up front
+- reduce early-page inconsistency
+
+Design constraint:
+- the default local workflow still needs to stay fast
+- heavier extraction paths remain optional
+
+The current implementation keeps pre-scan lightweight by default and avoids loading a second heavy extraction model unless explicitly requested.
+
+## Experimental Deep Discovery
+Deep Discovery remains in the codebase, but it is now treated as experimental.
+
+Intended role:
+- difficult edge cases
+- developer investigation
+- optional higher-cost discovery path
+
+It is not the main noun-consistency strategy anymore.
+
+UI status:
+- user-facing wording now marks it as optional and slower
+- standard workflow should keep it off
+
+## Rendering
+Rendering is handled in [renderer.py](app/render/renderer.py).
+
+Main responsibilities:
+- remove original text
+- preserve readable bubble structure where possible
+- handle dark captions and narration differently from standard speech bubbles
+- avoid translating meaningless background/SFX fragments when they should remain original
+- fit translated text into narrow or vertical regions without obvious overflow
+
+Recent quality work focused on:
+- reducing destructive cleanup
+- suppressing junk overlays from bad OCR fragments
+- improving dark-caption handling
+- improving narrow vertical bubble fitting
+
+The renderer still depends heavily on good upstream region grouping and OCR quality. If segmentation is poor, render-time fixes can only help partially.
+
+## Region Semantics
+The pipeline distinguishes different kinds of regions because they should not all be treated like ordinary speech bubbles.
+
+Important classes:
+- speech bubbles
+- dark captions / narration boxes
+- meaningful background text
+- SFX / ignorable decorative fragments
+
+This distinction is critical for both translation quality and image quality.
 
 ## Project JSON
-Each page contains a list of regions:
+Each page is saved with region-level structured data. Typical fields include:
+
 ```json
 {
   "region_id": "r000",
   "bbox": [x, y, w, h],
-  "polygon": [[[x, y], ...]],
+  "polygon": [[[x, y], [x2, y2]]],
   "type": "speech_bubble|background_text",
   "ocr_text": "...",
   "translation": "...",
-  "confidence": {"det": 1.0, "ocr": 1.0, "trans": 1.0},
-  "render": {"font": "Microsoft YaHei", "font_size": 0, "line_height": 1.2, "align": "center"},
-  "flags": {"ignore": false, "bg_text": false, "needs_review": false}
+  "confidence": {
+    "det": 1.0,
+    "ocr": 1.0,
+    "trans": 1.0
+  },
+  "render": {
+    "font": "Microsoft YaHei",
+    "font_size": 0,
+    "line_height": 1.2,
+    "align": "center"
+  },
+  "flags": {
+    "ignore": false,
+    "bg_text": false,
+    "needs_review": false
+  }
 }
 ```
 
-### JSON Block Explanation
-- `region_id`: Stable ID for tracking a text region across UI review and re-rendering.
-- `bbox`: Axis-aligned bounding box `[x, y, w, h]` used for layout.
-- `polygon`: Exact region outline; used for precise fill and text placement.
-- `type`: Region type (`speech_bubble` or `background_text`) which changes render logic.
-- `ocr_text`: Raw OCR output from the selected engine.
-- `translation`: Final translated text used by the renderer.
-- `confidence`: Detection/OCR/translation confidence fields (float 0-1).
-- `render`: Rendering preferences for this region (font, line height, color, stroke).
-- `flags`: Workflow flags (ignored regions, background text, or needs review).
+The JSON is designed for:
+- review and re-render workflows
+- manual correction
+- later consistency checks
 
-## Auto-Glossary
-When enabled:
-- OCR text is accumulated for noun discovery.
-- MeCab extracts proper nouns and groups aliases.
-- Translated names are stored in `style_guide.json`.
-- Optional Hybrid Discovery (LLM) can enrich the glossary.
-- A consistency check can suggest re-translation of early pages.
+## Startup Pre-Downloader
+The app checks for fixed runtime dependencies shortly after startup and offers to batch-download missing assets.
 
-## Rendering Strategy
-Rendering is handled by `app/render/renderer.py`:
-- Speech bubbles:
-  - **Adaptive Dilation**: Uses statistics (stddev) to apply aggressive dilation on uniform bubbles and minimal dilation on complex backgrounds.
-  - White Fill: For pure white bubbles, simple fill.
-  - Inpainting:
-    - **LaMa (AI)**: Used for complex backgrounds or when `inpaint_mode="ai"`. Handles large text removal better than CV2.
-    - **CV2 Telea/NS**: Fallback for simple cases or when AI is disabled.
-- Background text:
-  - **Vertical Text**: Detects tall regions (aspect ratio &lt; 0.8) and renders text vertically.
-  - Local color sampling fill to avoid mosaic artifacts.
-- Text layout:
-  - Auto font sizing to fit region.
-  - CJK-aware punctuation normalization.
-  - Line wrapping and centering.
+Current assets covered:
+- `ComicTextDetector`
+- `PaddleOCR`
+- `MangaOCR`
+- `Big-LAMA`
+- Japanese NER model
 
-### Rendering - Code Blocks Explained
-Key blocks in `renderer.py` and their purpose:
-- **Region classification**
-  - Determines if a region is a speech bubble or background text, based on detector hints
-    and luminance statistics. This controls the fill strategy.
-- **Background fill**
-  - Uses local color statistics to fill text areas instead of inpainting to avoid blur.
-- **Bubble fill**
-  - For solid bubbles, uses a clean fill; for complex bubbles, falls back to inpaint.
-- **Font sizing**
-  - Computes a font size that fits the region and avoids overflow.
-- **Text placement**
-  - Centers or aligns text based on the region’s bbox and chosen alignment.
+Startup entry:
+- [main_window.py](app/ui/main_window.py)
 
-## UI Pages
-- Home: progress, thumbnails, log, region review.
-- Queue: list of pages and status.
-- Library: completed pages list.
-- Settings: model selection, rendering, performance options.
+Download manager:
+- [downloader.py](app/models/downloader.py)
 
-### UI Code Blocks Explained
-- **Navigation**
-  - The left sidebar toggles pages in a stacked widget to switch between Home/Queue/Library/Settings.
-- **Home grid**
-  - Thumbnails are loaded lazily, with status overlays (processing/done/error).
-- **Live Inspection**
-  - Clicking a thumbnail updates the inspector panel with OCR + translation for quick spot-checking.
-- **Review Dialogs**
-  - **Page Review**: 
-    - Split view (Original vs Translated).
-    - **Resizable Images**: Images scale dynamically with window size.
-    - **Adjustable Layout**: Main splitter ratio favors images (5:1) for better visibility.
-    - Editable translation table with "Needs Review" flagging.
+Shared model resolution:
+- [resolution.py](app/models/resolution.py)
+
+Resolution order:
+1. system cache / environment cache
+2. project-local `models/`
+
+This behavior is intentional:
+- developers often already have model caches in their Python environment
+- new users still get a portable project-local fallback
+
+Recent hardening work aligned startup checks with runtime model resolution so a model marked “installed” at launch should not later trigger a surprise lazy download during translation.
+
+## Model Resolution
+Model resolution is now centralized instead of duplicated across loaders.
+
+Why this matters:
+- startup checks and runtime loaders must agree
+- otherwise the app can report “ready” and still fail or redownload later
+
+Shared resolver responsibilities:
+- MangaOCR system/local lookup
+- NER system/local lookup
+- Paddle detector and recognizer lookup
+
+Relevant file:
+- [resolution.py](app/models/resolution.py)
+
+## UI
+Main UI file:
+- [main_window.py](app/ui/main_window.py)
+
+Important Home glossary controls:
+- `Auto-Glossary (Name Memory)`
+- `Build Glossary Before Translation`
+- `Experimental Deep Discovery (Optional, slower)`
+
+Current UI behavior:
+- Auto-Glossary is the master switch
+- if it is off, pre-scan and deep discovery are disabled
+- wording now reflects the actual architecture rather than the older glossary design
 
 ## Performance
-Target: 6 pages under 2 minutes on the reference PC.
-Key optimizations:
-- Detection downscaling for speed, render on full-res image.
-- Translation cache for repeated lines.
-- Batched translation requests.
+Current target:
+- `6 pages under 2 minutes` on the reference PC
 
-## Error Handling
-The UI shows explicit error messages and does not silently ignore failures.
-Common issues:
-- Missing torch (MangaOCR fallback to PaddleOCR).
-- Missing models (prompt user to install).
+Validated recent behavior:
+- full-volume GPU run around `15-16s/page`
+- recent full-volume validation remained within the user’s runtime budget
 
-### Error Handling - Code Blocks Explained
-- **Dependency checks**
-  - Model init is guarded; dependency failures are surfaced as readable UI messages.
-- **Per-page failures**
-  - Errors are recorded in the queue table and log, not swallowed.
-- **Graceful fallbacks**
-  - OCR and translator backends can fall back when possible.
+The main cost drivers are:
+- detector runtime
+- OCR runtime
+- translation backend/runtime configuration
+- page density
+- inpainting/render complexity
 
-## Local Models
-Models are not committed to the repository. Place local models in:
-```
-models/
-  comic-text-detector/
-  sakura/
-  ...
-```
+## Error Handling and Fallbacks
+The app is designed to surface errors clearly in the UI and avoid silent failures.
+
+Examples:
+- missing MangaOCR dependencies -> readable error and fallback path
+- missing detector assets -> user-visible model guidance
+- startup model checks -> pre-download prompt before translation begins
+
+The goal is graceful fallback where reasonable, but not silent quality regression.
+
+## Local Data and Repository Conventions
+Not tracked in Git:
+- `models/`
+- `output/`
+- `Test Manga/`
+
+Tracked code of interest:
+- `app/`
+- `README.md`
+- `TECHNICAL.md`
+- `requirements.txt`
 
 ## Running
 From repo root:
-```
+
+```powershell
 python -m app.main
 ```
 
-## Testing
-- Small changes: `python -m py_compile <files>`
-- Full flow: run the app, load `Test Manga`, verify:
-  - No startup errors
-  - Output images show translated text in bubbles
-  - Project JSON saved
+## Verification
+Typical validation steps:
+- quick syntax check with `python -m py_compile`
+- startup smoke run
+- focused 6-page timing run
+- full-volume quality run when translation/rendering behavior changes materially

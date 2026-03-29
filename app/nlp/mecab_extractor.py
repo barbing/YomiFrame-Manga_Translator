@@ -190,6 +190,25 @@ class MeCabExtractor:
         Returns:
             Tuple of (pattern_type, base_reading, hint_for_translation)
         """
+        relaxed_variants = {
+            "さぁん": "さん",
+            "さあん": "さん",
+            "さーん": "さん",
+            "ちゃぁん": "ちゃん",
+            "ちゃあん": "ちゃん",
+            "ちゃーん": "ちゃん",
+            "くぅん": "くん",
+            "くうん": "くん",
+            "くーん": "くん",
+        }
+        relaxed_name = str(name or "")
+        relaxed_reading = str(reading or "")
+        for variant, normalized in relaxed_variants.items():
+            if relaxed_name.endswith(variant):
+                relaxed_name = f"{relaxed_name[:-len(variant)]}{normalized}"
+            if relaxed_reading.endswith(variant):
+                relaxed_reading = f"{relaxed_reading[:-len(variant)]}{normalized}"
+
         # Check for known suffixes (longest match first)
         for suffix in self._sorted_suffixes:
             # Check if name or reading ends with this suffix
@@ -200,6 +219,10 @@ class MeCabExtractor:
             elif reading.endswith(suffix):
                 info = self.suffixes[suffix]
                 base = reading[:-len(suffix)]
+                return info["pattern"], base, info.get("hint", "")
+            elif relaxed_name.endswith(suffix) or relaxed_reading.endswith(suffix):
+                info = self.suffixes[suffix]
+                base = relaxed_reading[:-len(suffix)] if relaxed_reading.endswith(suffix) else relaxed_reading
                 return info["pattern"], base, info.get("hint", "")
         
         # Check for reduplication (まゆまゆ → まゆ)
@@ -470,6 +493,57 @@ class MeCabExtractor:
                         reading=self._to_hiragana(name) if re.match(r'^[ァ-ヺー]+$', name) else name,
                         pos="人名_推測"
                     ))
+
+        # Pattern 5: Hiragana nicknames with honorifics
+        # e.g., まゆちゃん, ゆきえさん
+        hira_suffix_pattern = re.compile(
+            r'([ぁ-ゖー]{2,6}(?:ちゃん|たん|くん|さん|さま|せんせい|せんぱい))'
+        )
+        for match in hira_suffix_pattern.finditer(text):
+            alias = match.group(1)
+            base = alias
+            for suffix in self._sorted_suffixes:
+                if alias.endswith(suffix):
+                    base = alias[:-len(suffix)]
+                    break
+            if not base or base in self.kana_alias_blacklist or alias in already_seen:
+                continue
+            already_seen.add(alias)
+            boosted.append(ExtractedName(
+                surface=alias,
+                reading=self._to_hiragana(alias),
+                pos="人名_愛称"
+            ))
+
+        # Pattern 6: Hiragana reduplication nicknames
+        # e.g., まゆまゆ
+        hira_redup_pattern = re.compile(r'([ぁ-ゖー]{2,4})\1')
+        for match in hira_redup_pattern.finditer(text):
+            alias = match.group(0)
+            base = match.group(1)
+            if base in self.kana_alias_blacklist or alias in already_seen:
+                continue
+            already_seen.add(alias)
+            boosted.append(ExtractedName(
+                surface=alias,
+                reading=self._to_hiragana(alias),
+                pos="人名_愛称"
+            ))
+
+        # Pattern 7: Short hiragana names in quotes or directly followed by particles/punctuation
+        hira_context_pattern = re.compile(
+            r'(?:^|[「『（(、。！？!?…\s])([ぁ-ゖー]{2,4})(?=[がはをにへのとも、。！？!?…」』）)\s])'
+        )
+        for match in hira_context_pattern.finditer(text):
+            name = match.group(1)
+            if not name or name in already_seen or name in self.kana_alias_blacklist:
+                continue
+            already_seen.add(name)
+            boosted.append(ExtractedName(
+                surface=name,
+                reading=self._to_hiragana(name),
+                pos="人名_推測"
+            ))
         
         return boosted
     

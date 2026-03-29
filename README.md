@@ -1,106 +1,165 @@
-# Manga Translator (Windows, Python)
+# YomiFrame
 
-
-Manga Translation tool (Windows/GUI). Translates Japanese manga pages into English/Chinese with localized text rendering.
+YomiFrame is a Windows desktop app for local manga translation. It detects text, OCRs Japanese dialogue, translates it with local models, removes the original text, and renders readable translated text back into the page.
 
 ![Screenshot](assets/screenshot.png)
 
-## Key Features
-- Windows desktop GUI (PySide6)
-- Batch import/export folders
-- OCR engines: MangaOCR + PaddleOCR
-- Text detection: ComicTextDetector
-- Translators: Ollama (local models) and GGUF (llama.cpp)
-- Auto-Glossary (MeCab) for consistent noun translations
-- Hybrid Discovery (LLM) option for deeper glossary extraction
-- Deep Scan (Background Analysis) with separate backend/model
-- Per-model overrides (advanced generation settings)
-- Style guide JSON (glossary + prompts)
-- JSON project output for human edits + re-apply
-- Progress/ETA + per-page timing
-- Dark/Light theme
+## What It Does
+- Windows GUI built with PySide6
+- Batch translation from folder to folder
+- `ComicTextDetector` as the primary detector, with `PaddleOCR` fallback only when needed
+- OCR with `MangaOCR` and `PaddleOCR`
+- Translation with local `Ollama` or local `GGUF` models
+- Auto-Glossary / Name Memory for consistent proper nouns and aliases
+- Optional `Build Glossary Before Translation` mode for stronger volume-wide consistency
+- Experimental Deep Discovery for difficult extraction cases
+- Automatic first-launch pre-downloader for fixed runtime model assets
+- Project JSON output plus `style_guide.json`
 
-## Requirements
+## Current Workflow
+For normal use:
+
+1. Choose the input folder and export folder.
+2. Select source and target languages.
+3. Keep `Auto-Glossary (Name Memory)` enabled.
+4. Enable `Build Glossary Before Translation` for chapter or volume runs.
+5. Leave `Experimental Deep Discovery` off unless default discovery is insufficient.
+6. Start translation.
+
+Recommended default for Japanese -> Simplified Chinese:
+- Detector: `ComicTextDetector`
+- OCR: `MangaOCR`
+- Translator: `GGUF` with Sakura, or `Ollama` if that is your local setup
+- Auto-Glossary: `On`
+- Build Glossary Before Translation: `On` for full volumes
+- Experimental Deep Discovery: `Off`
+
+## Auto-Glossary / Name Memory
+The glossary system is no longer just a flat term list. It now builds character/name memory from OCR text and uses that memory during translation.
+
+Highlights:
+- prefers canonical kanji names when available
+- handles common kana aliases and nickname variants more reliably
+- keeps exported `style_guide.json` cleaner and less prone to poisoned entries
+- improves cross-page consistency for names, places, and references
+
+Important limitation:
+- if a chapter contains only kana aliases and never contains a canonical reference, the app cannot reliably reconstruct the original kanji form on its own
+- if the user already has a `style_guide.json` from previous sessions, that guide can still provide the missing canonical mapping
+
+## Pre-Downloader
+On startup, the app checks for required fixed runtime assets and offers to download missing ones in one batch before translation starts.
+
+Covered assets:
+- `ComicTextDetector`
+- `PaddleOCR`
+- `MangaOCR`
+- `Big-LAMA`
+- Japanese NER model
+
+Resolution order:
+1. Existing system cache / environment cache
+2. Project-local `models/` fallback
+
+This keeps developer environments efficient while still supporting new users who need project-local downloads.
+
+## Models
+Local models are not committed to the repository.
+
+Typical layout:
+
+```text
+models/
+  comic-text-detector/
+  manga-ocr/
+  paddleocr/
+  lama/
+  sakura/
+  qwen/
+```
+
+### GGUF
+- Place `.gguf` files under `models/`
+- The app scans `models/**.gguf`
+- Example:
+  - `models/sakura/sakura-14b-qwen3-v1.5-q6k.gguf`
+
+### Ollama
+- Install Ollama separately
+- Ensure the Ollama server is running
+- Use the model dropdown in the UI
+
+## Installation
+Environment target:
 - Windows 10/11
 - Python 3.10
-- GPU recommended (RTX 4080 Super supported)
+- Conda environment recommended
 
-## Install Dependencies (pip)
+Install:
+
 ```powershell
 pip install -r requirements.txt
 ```
 
 Notes:
-- For GPU acceleration, prefer installing PyTorch/Paddle GPU builds via conda.
-- AI inpainting uses LaMa (models downloaded automatically on first use).
+- `requirements.txt` keeps CPU-safe defaults where possible
+- for GPU acceleration on Windows, install the correct CUDA-enabled `torch`, `paddlepaddle-gpu`, and GPU-capable `llama-cpp-python` build in your own environment as needed
 
-## Run the App
+## Run
+From the repo root:
+
 ```powershell
 python -m app.main
 ```
 
-## Basic Workflow
-1. Select **Manga Folder** (input images).
-2. Select **Export Folder**.
-3. (Optional) Set **Project JSON** output path.
-4. Choose **Translator** (Ollama or GGUF).
-5. Choose **OCR Engine** (MangaOCR recommended).
-6. Press **Start**.
-7. (Optional) Enable **Auto Glossary** for consistent names.
-8. (Optional) Enable **Hybrid Discovery (LLM)** for deeper noun extraction.
-
 ## Output
-- Rendered images in the export folder.
-- `project.json` with regions, OCR text, translations, render params, and flags.
-- `style_guide.json` (when Auto-Glossary is enabled) saved to the export folder.
+Each run can generate:
+- translated images in the export folder
+- `project.json`
+- `style_guide.json` when Auto-Glossary is enabled
 
-## Re-apply Edited JSON
-1. Manually edit `project.json`.
-2. Click **Import JSON (Re-apply)** to render your edits without re-translation.
-3. If Auto-Glossary finds new name translations after the run, use the
-   **Consistency Check** dialog to re-translate affected pages.
+`project.json` stores regions, OCR text, translations, and render settings so results can be reviewed and re-applied later.
 
-## Models
-### Ollama
-- Ensure `ollama` is installed and running.
-- Use **Ollama Model** dropdown (auto-detect).
+## Performance
+Reference validation on the current local test volume:
+- full volume run completed within the target budget
+- recent validated run averaged about `15-16s/page` on GPU
+- target remains `6 pages under 2 minutes`
 
-### GGUF
-- Place `.gguf` models under `models/`.
-- The app auto-scans `models/**.gguf` and lists them in **GGUF Model**.
-- Example: `models/sakura/sakura-14b-qwen3-v1.5-q6k.gguf`
-
-### ComicTextDetector Model (Local)
-- Models are not tracked in the repository to keep size small.
-- Place the ComicTextDetector model files under `models/comic-text-detector/`.
-  (See the ComicTextDetector release page linked in the app error message.)
+Actual speed depends on:
+- detector choice
+- OCR engine
+- translator backend
+- GPU availability
+- page density
 
 ## Troubleshooting
-### Ollama warnings
-If Ollama is selected but not running, the UI will show a warning. Start it with
-`ollama serve` or switch to GGUF.
+### MangaOCR fails to load
+The app will try the normal path first, then worker-process fallback, then `PaddleOCR` if needed.
 
-### App finishes instantly / no output
-On Windows, OpenCV cannot read non-ASCII file paths with `cv2.imread`.
-Use ASCII-only paths or the updated detectors (this repo already includes
-Unicode-safe image loading via `cv2.imdecode`).
+### ComicTextDetector fails
+`ComicTextDetector` is the intended default detector. `PaddleOCR` detector fallback exists only as an emergency path.
 
-### MangaOCR download SSL errors
-If the model is not cached, slow or blocked network can fail. Retry or pre-download
-the model. If cached, the warnings can be ignored.
+### Ollama warning
+Start Ollama with:
 
-### GPU not used (GGUF)
-GGUF needs CUDA-enabled `llama-cpp-python`. Verify GPU support in your environment.
+```powershell
+ollama serve
+```
 
-### Missing small bubbles
-Increase detection sensitivity or use ComicTextDetector with GPU model if available.
+Or switch to GGUF.
 
-## Development Notes
-- Default runtime: `python -m app.main`
-- Quick syntax check: `python -m py_compile <files>`
-- Keep changes minimal and focused.
-- Avoid heavy dependencies unless required.
+### Missing models on first run
+Allow the startup pre-downloader to fetch the required runtime assets.
+
+### GPU not used for GGUF
+Install a CUDA-capable `llama-cpp-python` build and verify your model/backend configuration.
+
+## Repository Notes
+- `Test Manga/` is local test data and is not tracked
+- `models/` is local and not tracked
+- runtime behavior is documented in [TECHNICAL.md](TECHNICAL.md)
+- packaging notes are in [BUILD_EXE.md](BUILD_EXE.md)
 
 ## License
-This project integrates third-party components under their respective licenses.
-See `app/third_party/` for details.
+This project integrates third-party components under their own licenses. See `app/third_party/` for details.

@@ -1,8 +1,8 @@
-# Core GUI
+# GUI
 PySide6
 qtawesome
 
-# Imaging / rendering
+# Core imaging
 Pillow
 opencv-python
 numpy==1.26.4
@@ -10,28 +10,28 @@ numpy==1.26.4
 # OCR / detection
 manga-ocr
 paddleocr
-# CPU-only PaddlePaddle (GPU users can install paddlepaddle-gpu via conda)
 paddlepaddle
+onnxruntime
 
 # Translation backends
 requests
 llama-cpp-python
 
-# ComicTextDetector (ONNX path)
-onnxruntime
-
-# HuggingFace stack (manga-ocr / inpainting)
+# Hugging Face / model download
 transformers
 huggingface-hub>=0.19.3,<1.0
+safetensors
 
-# AI Inpainting
+# Inpainting
 simple-lama-inpainting
 torch
 
-# Japanese NLP (MeCab for proper noun extraction / Auto-Glossary)
+# Japanese NLP for Auto-Glossary / Name Memory
 fugashi>=1.3.0
 unidic-lite>=1.0.8
 
-# Optional GPU stack (recommend via conda for Windows)
-# paddlepaddle-gpu
-# torchvision
+# Notes:
+# - This file keeps CPU-safe defaults where possible.
+# - On Windows, GPU users should usually install CUDA-enabled torch,
+#   paddlepaddle-gpu, and a GPU-capable llama-cpp-python build via conda/pip
+#   for their own environment instead of relying on these default wheels.

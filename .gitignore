@@ -22,11 +22,15 @@ output/
 *.sqlite
 logs/
 
+# executables
+*.exe
+*.spec
+
 # Local test data (not for repo)
 Test Manga/
-AGENTS.md
-tmp_run.py
 
 # Models (kept local; not tracked)
 models/
 dist/
+!app/models/
+!app/models/*.py

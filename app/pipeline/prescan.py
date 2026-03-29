@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 """Pre-scan module for building glossary before translation.
 
-This module performs a fast OCR-first pass on all manga pages to extract
+This module performs a light OCR-first pass on all manga pages to extract
 character names and build a complete glossary before translation begins.
+The default path stays lightweight: OCR + MeCab + alias graph + glossary
+translation with the active translator. Heavier NER remains opt-in.
 """
 from __future__ import annotations
 
 import os
 import logging
+import re
 from typing import Callable, Optional, TYPE_CHECKING
 
 from PySide6 import QtCore
@@ -88,8 +91,8 @@ def prescan_for_glossary(
     """
     Pre-scan all images and build a complete glossary.
     
-    This runs OCR + NER/MeCab extraction on all pages, then translates
-    accepted name candidates using the active translator client.
+    This runs OCR + lightweight entity extraction on all pages, then
+    translates accepted name candidates using the active translator client.
     
     Args:
         import_dir: Path to manga images folder
@@ -146,7 +149,6 @@ def prescan_for_glossary(
     
     # Initialize NLP components
     from app.nlp.character_graph import CharacterGraph
-    from app.nlp.ner_extractor import NERExtractor
     from app.nlp.mecab_extractor import MeCabExtractor
     from collections import defaultdict
 
@@ -162,6 +164,7 @@ def prescan_for_glossary(
         "すまん", "スマン", "ごめん",
         "助平", "スケベ",
         "民草",
+        "日本", "勇者",
         "イイ", "いい",
         "うわーこ", "うわあ",
         "クリス緩ー",
@@ -179,8 +182,19 @@ def prescan_for_glossary(
     
     try:
         mecab = MeCabExtractor()
-        # NER extractor (falls back to MeCab if needed)
-        ner = NERExtractor()
+        ner = None
+        use_ner = bool(
+            getattr(settings, "prescan_use_ner", False)
+            or os.getenv("MT_PRESCAN_USE_NER") == "1"
+        )
+        if use_ner:
+            from app.nlp.ner_extractor import NERExtractor
+
+            ner = NERExtractor()
+            if message_callback:
+                message_callback("Pre-Scan mode: MeCab + NER enhancement enabled.")
+        elif message_callback:
+            message_callback("Pre-Scan mode: lightweight MeCab discovery.")
     except Exception as e:
         if message_callback:
             message_callback(f"NLP initialization failed: {e}. Pre-scan skipped.")
@@ -199,7 +213,16 @@ def prescan_for_glossary(
         
         try:
             # Detect text regions
-            detections = detector.detect(image_path)
+            from app.pipeline.controller import _detect_regions, _get_image_size
+
+            detections = _detect_regions(
+                detector,
+                image_path,
+                _get_image_size(image_path),
+                input_size=min(768, int(getattr(settings, "detector_input_size", 1024) or 1024)),
+                use_gpu=settings.use_gpu,
+                message_callback=message_callback,
+            )
             page_image = _load_image_cv2(image_path)
             if page_image is None:
                 continue
@@ -240,7 +263,7 @@ def prescan_for_glossary(
                     # Extract names from this text block
                     names = []
                     ner_conf_map = {}
-                    if ner.is_available():
+                    if ner and ner.is_available():
                         entities = ner.extract_names(text)
                         names = ner.to_extracted_names(entities)
                         for entity in entities:
@@ -402,14 +425,27 @@ def prescan_for_glossary(
         translated_name = str(char.get("translation") or "").strip()
         reading = str(char.get("reading", "")).strip()
         aliases_raw = sorted(set(char.get("aliases", []) or []))
+        if not translated_name and canonical not in preserved_canonicals:
+            continue
+        if not translated_name and _is_all_kana_candidate(canonical):
+            if not _has_non_kana_alias(aliases_raw, canonical):
+                continue
         alias_objs = []
         for alias in aliases_raw:
             alias_source = str(alias).strip()
             if not alias_source or alias_source == canonical:
                 continue
-            alias_obj = _build_alias_object(alias_source, translated_name, mecab)
-            alias_objs.append(alias_obj)
-            if translated_name:
+            alias_obj = _build_alias_object(
+                alias_source,
+                canonical,
+                reading,
+                translated_name,
+                mecab,
+                translator=translator,
+                settings=settings,
+            )
+            if alias_obj.get("target"):
+                alias_objs.append(alias_obj)
                 generated_glossary.append(_alias_obj_to_glossary_entry(alias_obj))
         normalized_chars.append(
             {
@@ -584,6 +620,138 @@ def _is_name_like(text: str) -> bool:
     return has_cjk or has_alpha
 
 
+def _is_loose_kana_candidate(text: str) -> bool:
+    if not text:
+        return False
+    if _has_honorific_suffix(text):
+        return False
+    for ch in text:
+        code = ord(ch)
+        if not (0x3040 <= code <= 0x30FF or ch == "ー"):
+            return False
+    return True
+
+
+def _is_hiragana_only(text: str) -> bool:
+    text = str(text or "")
+    return bool(text) and all((0x3040 <= ord(ch) <= 0x309F) or ch == "ー" for ch in text)
+
+
+def _is_katakana_only(text: str) -> bool:
+    text = str(text or "")
+    return bool(text) and all((0x30A0 <= ord(ch) <= 0x30FF) or ch == "ー" for ch in text)
+
+
+def _is_all_kana_candidate(text: str) -> bool:
+    text = str(text or "")
+    return bool(text) and all((0x3040 <= ord(ch) <= 0x30FF) or ch == "ー" for ch in text)
+
+
+def _has_honorific_suffix(text: str) -> bool:
+    text = str(text or "")
+    if not text:
+        return False
+    relaxed_variants = {
+        "さぁん": "さん",
+        "さあん": "さん",
+        "さーん": "さん",
+        "ちゃぁん": "ちゃん",
+        "ちゃあん": "ちゃん",
+        "ちゃーん": "ちゃん",
+        "くぅん": "くん",
+        "くうん": "くん",
+        "くーん": "くん",
+    }
+    relaxed = text
+    for variant, normalized in relaxed_variants.items():
+        if relaxed.endswith(variant):
+            relaxed = f"{relaxed[:-len(variant)]}{normalized}"
+            break
+
+    false_honorific_words = {
+        "みなさん",
+        "皆さん",
+        "たくさん",
+        "沢山",
+        "おじさん",
+        "オジサン",
+        "おばさん",
+        "オバサン",
+    }
+    if relaxed in false_honorific_words:
+        return False
+    if relaxed.endswith(("みなさん", "皆さん", "たくさん", "沢山")):
+        return False
+
+    for suffix in ("さん", "くん", "ちゃん", "さま", "様", "先生", "先輩", "殿"):
+        if not relaxed.endswith(suffix):
+            continue
+        base = relaxed[: -len(suffix)] if len(suffix) < len(relaxed) else ""
+        if not base:
+            continue
+        if any(ch in base for ch in ("の", "が", "を", "に", "へ", "と", "も", "や", "か", "は", "で")):
+            continue
+        return True
+    return False
+
+
+def _is_japanese_word_char(ch: str) -> bool:
+    if not ch:
+        return False
+    code = ord(ch)
+    return (
+        0x3040 <= code <= 0x30FF
+        or 0x4E00 <= code <= 0x9FFF
+        or 0x3400 <= code <= 0x4DBF
+    )
+
+
+def _context_boundary_ratio(surface: str, contexts: list[str]) -> float:
+    surface = str(surface or "").strip()
+    if not surface:
+        return 0.0
+
+    hits = 0
+    bounded = 0
+    for sentence in contexts or []:
+        text = str(sentence or "")
+        if not text:
+            continue
+        start = 0
+        while True:
+            idx = text.find(surface, start)
+            if idx < 0:
+                break
+            hits += 1
+            left = text[idx - 1] if idx > 0 else ""
+            right_index = idx + len(surface)
+            right = text[right_index] if right_index < len(text) else ""
+            if not _is_japanese_word_char(left) and not _is_japanese_word_char(right):
+                bounded += 1
+            start = idx + len(surface)
+    if hits <= 0:
+        return 0.0
+    return bounded / float(hits)
+
+
+def _has_non_kana_alias(aliases: list[str] | set[str], canonical: str = "") -> bool:
+    canonical = str(canonical or "").strip()
+    for alias in aliases or []:
+        alias = str(alias or "").strip()
+        if alias and alias != canonical and not _is_loose_kana_candidate(alias):
+            return True
+    return False
+
+
+def _should_auto_translate_canonical(node) -> bool:
+    canonical = str(getattr(node, "canonical", "") or "").strip()
+    if not canonical or getattr(node, "translation", None):
+        return False
+    if not _is_all_kana_candidate(canonical):
+        return True
+    return _has_non_kana_alias(getattr(node, "aliases", set()) or set(), canonical)
+
+
 def _score_character_node(node, candidate_stats: dict) -> tuple[float, int, int, float, float]:
     total_count = 0
     page_set = set()
@@ -615,7 +783,28 @@ def _score_character_node(node, candidate_stats: dict) -> tuple[float, int, int,
     return score, total_count, page_count, avg_ocr, avg_ner
 
 
-def _should_keep_character(canonical: str, score: float, total_count: int, page_count: int, avg_ocr: float, avg_ner: float) -> bool:
+def _should_keep_character(node, score: float, total_count: int, page_count: int, avg_ocr: float, avg_ner: float) -> bool:
+    canonical = str(getattr(node, "canonical", "") or "").strip()
+    if not canonical:
+        return False
+
+    if _is_loose_kana_candidate(canonical):
+        boundary_ratio = _context_boundary_ratio(canonical, getattr(node, "context_sentences", []) or [])
+        has_honorific = _has_honorific_suffix(canonical)
+
+        if len(canonical) <= 2 and not has_honorific:
+            return False
+        if boundary_ratio < 0.35 and total_count < 3 and not has_honorific:
+            return False
+        if _is_hiragana_only(canonical) and not has_honorific:
+            if total_count < 3 or page_count < 2 or avg_ocr < 0.50:
+                return False
+        if _is_katakana_only(canonical) and len(canonical) <= 3 and not has_honorific:
+            if total_count < 3 and page_count < 2:
+                return False
+        if total_count < 2 and page_count < 2 and avg_ner < 0.82:
+            return False
+
     if score >= 0.58:
         return True
     if total_count >= 3 and avg_ocr >= 0.45:
@@ -642,7 +831,7 @@ def _filter_graph_by_confidence(graph, candidate_stats: dict, preserved_canonica
             keep = True
         else:
             score, total_count, page_count, avg_ocr, avg_ner = _score_character_node(node, candidate_stats)
-            keep = _should_keep_character(canonical, score, total_count, page_count, avg_ocr, avg_ner)
+            keep = _should_keep_character(node, score, total_count, page_count, avg_ocr, avg_ner)
 
         if not keep:
             continue
@@ -705,13 +894,15 @@ def _translate_graph_nodes_with_active_client(
     settings: "PipelineSettings",
     message_callback: Optional[Callable[[str], None]] = None,
 ) -> int:
+    from app.pipeline.controller import _sanitize_glossary_target
+
     if translator is None:
         return 0
 
     terms_to_translate = [
         node.canonical
         for node in graph._nodes.values()
-        if node.canonical and not getattr(node, "translation", None)
+        if _should_auto_translate_canonical(node)
     ]
     if not terms_to_translate:
         return 0
@@ -730,6 +921,9 @@ def _translate_graph_nodes_with_active_client(
                 for term in terms_to_translate:
                     raw = str(translations_map.get(term, "")).strip()
                     cleaned = _clean_name_translation(raw, term)
+                    if not cleaned and _is_all_han(term):
+                        cleaned = term
+                    cleaned = _sanitize_glossary_target(cleaned, term, settings.target_lang)
                     if not cleaned:
                         continue
                     if term in graph._nodes:
@@ -741,7 +935,7 @@ def _translate_graph_nodes_with_active_client(
     remaining = [
         node.canonical
         for node in graph._nodes.values()
-        if node.canonical and not getattr(node, "translation", None)
+        if _should_auto_translate_canonical(node)
     ]
     if not remaining or not hasattr(translator, "generate"):
         return translated_count
@@ -762,6 +956,9 @@ def _translate_graph_nodes_with_active_client(
                 options={"num_predict": 60, "temperature": 0.1},
             )
             cleaned = _clean_name_translation(str(result).strip(), term)
+            if not cleaned and _is_all_han(term):
+                cleaned = term
+            cleaned = _sanitize_glossary_target(cleaned, term, settings.target_lang)
             if not cleaned:
                 continue
             if term in graph._nodes:
@@ -772,7 +969,15 @@ def _translate_graph_nodes_with_active_client(
     return translated_count
 
 
-def _build_alias_object(alias_source: str, translated_name: str, mecab) -> dict:
+def _build_alias_object(
+    alias_source: str,
+    canonical_source: str,
+    canonical_reading: str,
+    translated_name: str,
+    mecab,
+    translator=None,
+    settings: "PipelineSettings" | None = None,
+) -> dict:
     alias_reading = ""
     pattern = ""
     hint = ""
@@ -785,13 +990,224 @@ def _build_alias_object(alias_source: str, translated_name: str, mecab) -> dict:
         except Exception:
             pass
 
+    alias_target = _resolve_alias_translation(
+        alias_source=alias_source,
+        alias_reading=alias_reading,
+        canonical_source=canonical_source,
+        canonical_reading=canonical_reading,
+        canonical_translation=translated_name,
+        mecab=mecab,
+        translator=translator,
+        settings=settings,
+        pattern=pattern,
+        hint=hint,
+    )
+
     return {
         "source": alias_source,
-        "target": translated_name,
+        "target": alias_target,
         "reading": alias_reading,
         "pattern": pattern,
         "hint": hint,
     }
+
+
+def _resolve_alias_translation(
+    alias_source: str,
+    alias_reading: str,
+    canonical_source: str,
+    canonical_reading: str,
+    canonical_translation: str,
+    mecab,
+    translator=None,
+    settings: "PipelineSettings" | None = None,
+    pattern: str = "",
+    hint: str = "",
+) -> str:
+    from app.pipeline.controller import _sanitize_glossary_target
+
+    canonical_translation = str(canonical_translation or "").strip()
+    if not canonical_translation:
+        return ""
+
+    alias_source = str(alias_source or "").strip()
+    canonical_source = str(canonical_source or "").strip()
+    canonical_reading = str(canonical_reading or "").strip()
+    alias_reading = str(alias_reading or "").strip()
+    if not alias_source:
+        return ""
+    if alias_source == canonical_source or alias_reading == canonical_reading:
+        return canonical_translation
+
+    base_reading = alias_reading
+    if mecab and mecab.is_available():
+        try:
+            _, detected_base, detected_hint = mecab.detect_pattern(alias_source, alias_reading or alias_source)
+            if detected_base:
+                base_reading = detected_base
+            if detected_hint and not hint:
+                hint = str(detected_hint).strip()
+        except Exception:
+            pass
+
+    segments = _split_canonical_name_segments(
+        canonical_source,
+        canonical_translation,
+        canonical_reading,
+        mecab,
+    )
+    matched = _match_alias_segment(base_reading, alias_reading, alias_source, segments)
+    if matched:
+        segment_target = str(matched.get("target", "")).strip() or canonical_translation
+        segment_reading = str(matched.get("reading", "")).strip()
+        if pattern in {"plain", "", "canonical"} and base_reading == segment_reading:
+            return _sanitize_glossary_target(segment_target, alias_source, settings.target_lang if settings else "Simplified Chinese")
+
+        heuristic_pattern = pattern
+        if pattern in {"plain", "", "canonical"} and base_reading and segment_reading and base_reading != segment_reading:
+            heuristic_pattern = "chan"
+        heuristic = _heuristic_alias_target(segment_target, heuristic_pattern)
+        if heuristic:
+            return _sanitize_glossary_target(heuristic, alias_source, settings.target_lang if settings else "Simplified Chinese")
+
+        translated = _translate_alias_with_active_client(
+            translator,
+            settings,
+            alias_source,
+            hint,
+            segment_target,
+        )
+        if translated:
+            return _sanitize_glossary_target(translated, alias_source, settings.target_lang if settings else "Simplified Chinese")
+        return _sanitize_glossary_target(segment_target, alias_source, settings.target_lang if settings else "Simplified Chinese")
+    return ""
+
+
+def _split_canonical_name_segments(
+    canonical_source: str,
+    canonical_translation: str,
+    canonical_reading: str,
+    mecab,
+) -> list[dict]:
+    segments: list[dict] = []
+    if mecab and getattr(mecab, "tagger", None):
+        try:
+            raw_tokens = []
+            for word in mecab.tagger(canonical_source):
+                surface = str(getattr(word, "surface", "") or "")
+                if not surface.strip():
+                    continue
+                try:
+                    kana = getattr(word.feature, "kana", None) or surface
+                except Exception:
+                    kana = surface
+                raw_tokens.append({"source": surface, "reading": mecab._to_hiragana(kana)})
+            if raw_tokens and "".join(token["source"] for token in raw_tokens) == canonical_source:
+                segments = raw_tokens
+        except Exception:
+            segments = []
+
+    if not segments:
+        segments = [{"source": canonical_source, "reading": canonical_reading or canonical_source}]
+
+    if _is_all_han(canonical_translation) and _is_all_han(canonical_source):
+        if sum(len(seg["source"]) for seg in segments) == len(canonical_translation):
+            offset = 0
+            for seg in segments:
+                seg_len = len(seg["source"])
+                seg["target"] = canonical_translation[offset : offset + seg_len]
+                offset += seg_len
+        else:
+            for seg in segments:
+                seg["target"] = seg["source"]
+    else:
+        for seg in segments[:-1]:
+            seg["target"] = seg["source"] if _is_all_han(seg["source"]) else ""
+        segments[-1]["target"] = canonical_translation
+
+    return [seg for seg in segments if str(seg.get("source", "")).strip()]
+
+
+def _match_alias_segment(
+    base_reading: str,
+    alias_reading: str,
+    alias_source: str,
+    segments: list[dict],
+) -> dict | None:
+    if not segments:
+        return None
+    for seg in segments:
+        if base_reading and base_reading == seg.get("reading"):
+            return seg
+        if alias_source and alias_source == seg.get("source"):
+            return seg
+    for seg in segments:
+        seg_reading = str(seg.get("reading", "")).strip()
+        if not seg_reading or len(base_reading) < 2:
+            continue
+        if seg_reading.startswith(base_reading) or base_reading.startswith(seg_reading):
+            return seg
+    for seg in segments:
+        seg_reading = str(seg.get("reading", "")).strip()
+        if not seg_reading or len(alias_reading) < 2:
+            continue
+        if seg_reading.startswith(alias_reading) or alias_reading.startswith(seg_reading):
+            return seg
+    return None
+
+
+def _translate_alias_with_active_client(
+    translator,
+    settings: "PipelineSettings" | None,
+    alias_source: str,
+    hint: str,
+    base_translation: str,
+) -> str:
+    if translator is None or settings is None or not hasattr(translator, "generate"):
+        return ""
+    model_name = _resolve_prescan_model_name(settings, translator)
+    target_lang = settings.target_lang
+    if target_lang not in {"Simplified Chinese", "Traditional Chinese"}:
+        return ""
+
+    if hint:
+        prompt = (
+            f"'{alias_source}'是对人物'{base_translation}'的{hint}。\n"
+            f"把这个称呼翻译成{target_lang}。\n"
+            "只输出译名，不要解释。"
+        )
+    else:
+        prompt = (
+            f"'{alias_source}'是人物'{base_translation}'的简称或昵称。\n"
+            f"把这个称呼翻译成{target_lang}。\n"
+            "只输出译名，不要解释。"
+        )
+    try:
+        result = translator.generate(
+            model_name,
+            prompt,
+            timeout=30,
+            options={"num_predict": 30, "temperature": 0.1},
+        )
+        return _clean_name_translation(str(result or "").strip(), alias_source)
+    except Exception:
+        return ""
+
+
+def _heuristic_alias_target(base_target: str, pattern: str) -> str:
+    base_target = str(base_target or "").strip()
+    if not base_target:
+        return ""
+    if pattern in {"chan", "tan", "cchi", "rin", "pyon"}:
+        if len(base_target) <= 2:
+            return f"小{base_target}"
+        return base_target
+    if pattern == "reduplication":
+        tail = base_target[-1]
+        if len(base_target) <= 2:
+            return f"小{base_target}{tail}"
+        return f"{base_target}{tail}"
+    return base_target
 
 
 def _alias_obj_to_glossary_entry(alias_obj: dict) -> dict:
@@ -863,7 +1279,7 @@ def _batch_translate_nodes(
     try:
         if settings.translator_backend == "GGUF":
             from app.translate.gguf_client import GGUFClient
-            n_gpu = settings.gguf_n_gpu_layers if settings.use_gpu else 0
+            n_gpu = settings.gguf_n_gpu_layers
             client = GGUFClient(
                 model_path=settings.gguf_model_path,
                 prompt_style=settings.gguf_prompt_style,
@@ -975,7 +1391,16 @@ def _clean_name_translation(translation: str, source: str) -> str:
     
     # Remove quotes
     cleaned = cleaned.strip("\"'""''「」『』")
-    
+
+    # Prefer the shortest punctuation-delimited fragment that still looks like the name.
+    if any(sep in cleaned for sep in "，,。！？：；:; "):
+        parts = [part.strip() for part in re.split(r"[，,。！？：；:;\s]+", cleaned) if part.strip()]
+        if parts:
+            for part in reversed(parts):
+                if part == source or part.endswith(source) or source.endswith(part):
+                    cleaned = part
+                    break
+
     # Remove trailing punctuation
     cleaned = cleaned.rstrip("。.，,、：:")
     
@@ -1006,8 +1431,19 @@ def _clean_name_translation(translation: str, source: str) -> str:
     # Exception: English names can have spaces
     if " " in cleaned and not any(ord(c) < 128 for c in cleaned):
         return ""
+
+    # For kanji-only names in JP->CN, preserve the original if the model wrapped it in context.
+    if _is_all_han(source) and (cleaned == source or source in cleaned):
+        return source
     
     return cleaned
+
+
+def _is_all_han(text: str) -> bool:
+    text = str(text or "").strip()
+    if not text:
+        return False
+    return all(0x4E00 <= ord(ch) <= 0x9FFF for ch in text)
 
 
 def _polygon_to_rect(poly: list) -> list:

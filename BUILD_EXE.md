@@ -1,4 +1,4 @@
-# Building Manga Translator EXE
+# Building YomiFrame EXE
 
 ## Prerequisites
 1.  **Install PyInstaller**:
@@ -18,11 +18,11 @@ pyinstaller manga_translator.spec
 ```
 
 ## Output
-*   The built application will be in `dist/MangaTranslator`.
-*   Run `MangaTranslator.exe` inside that folder.
+*   The built application will be in `dist/YomiFrame`.
+*   Run `YomiFrame.exe` inside that folder.
 
 ## Models
 The EXE does **not** bundle the large model files (to prevent the EXE from being 10GB+).
-*   **Copy your `models/` folder** into the `dist/MangaTranslator/` folder.
+*   **Copy your `models/` folder** into the `dist/YomiFrame/` folder.
 *   The first time you run it on a new machine, it may try to download huggingface models (MangaOCR/LaMa) if they are not cached.
     *   To make it truly offline, verify where `cache_dir` is or pre-download models into `~/.cache/huggingface` on the target machine.

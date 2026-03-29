@@ -3,6 +3,7 @@
 from __future__ import annotations
 import os
 from typing import Optional
+from app.models.resolution import resolve_paddle_local_rec_dir, resolve_paddle_system_rec_dir
 
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
 os.environ.setdefault("FLAGS_enable_mkldnn", "0")
@@ -30,67 +31,18 @@ class PaddleOcrRecognizer:
         cls_model_dir = None
         lang = "japan"
 
-        # 1. System Cache (Priority 1)
-        use_system = False
-        system_lang = None
-        try:
-            home = os.path.expanduser("~")
-            system_rec_paths = {
-                "japan": [
-                    os.path.join(home, ".paddleocr", "whl", "rec", "japan", "japan_PP-OCRv4_rec_infer"),
-                    os.path.join(home, ".paddleocr", "whl", "rec", "japan", "japan_PP-OCRv3_rec_infer"),
-                ],
-                "ch": [
-                    os.path.join(home, ".paddleocr", "whl", "rec", "ch", "ch_PP-OCRv4_rec_infer"),
-                    os.path.join(home, ".paddleocr", "whl", "rec", "ch", "ch_PP-OCRv3_rec_infer"),
-                ],
-            }
-            if requested_lang in {"japan", "ch"}:
-                candidates = system_rec_paths[requested_lang]
-            else:
-                candidates = system_rec_paths["japan"] + system_rec_paths["ch"]
-            for path in candidates:
-                if os.path.exists(path):
-                    use_system = True
-                    system_lang = "japan" if "japan" in path else "ch"
-                    break
-        except Exception:
-            pass
-
-        # 2. Local models (Priority 2 if system cache unavailable)
-        app_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        models_dir = os.path.join(app_root, "models", "paddleocr")
-        local_map = {
-            "japan": [
-                os.path.join(models_dir, "japan_PP-OCRv4_rec_infer"),
-                os.path.join(models_dir, "japan_PP-OCRv3_rec_infer"),
-            ],
-            "ch": [
-                os.path.join(models_dir, "ch_PP-OCRv4_rec_infer"),
-                os.path.join(models_dir, "ch_PP-OCRv3_rec_infer"),
-            ],
-        }
-        local_lang = None
-        local_rec = None
-        if not use_system:
-            preferred_order = [requested_lang] if requested_lang in {"japan", "ch"} else ["japan", "ch"]
-            for choice in preferred_order:
-                for candidate in local_map[choice]:
-                    if os.path.exists(candidate):
-                        local_lang = choice
-                        local_rec = candidate
-                        break
-                if local_rec:
-                    break
+        system_rec, system_lang = resolve_paddle_system_rec_dir(requested_lang)
+        if system_rec is None:
+            local_rec, local_lang, local_cls = resolve_paddle_local_rec_dir(requested_lang)
             if local_rec:
                 rec_model_dir = local_rec
-            local_cls = os.path.join(models_dir, "ch_ppocr_mobile_v2.0_cls_infer")
-            if os.path.exists(local_cls):
-                cls_model_dir = local_cls
+            cls_model_dir = local_cls
+        else:
+            local_lang = None
 
         if requested_lang in {"japan", "ch"}:
             lang = requested_lang
-        elif use_system and system_lang:
+        elif system_rec and system_lang:
             lang = system_lang
         elif local_lang:
             lang = local_lang

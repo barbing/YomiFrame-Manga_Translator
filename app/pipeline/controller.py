@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 import sys
 from dataclasses import dataclass
+from typing import Iterable
 from app.pipeline.filters import TextFilter
 from PySide6 import QtCore
 from app.io.project import default_project_dict, save_project
@@ -79,6 +80,7 @@ class PipelineSettings:
     discovery_model: str | None = None # Model to use for discovery (None=Auto)
     discovery_backend: str = "Ollama" # "Ollama" or "GGUF"
     prescan_enabled: bool = False  # Run pre-scan to build glossary before translation
+    prescan_use_ner: bool = False  # Optional heavy NER enhancement for pre-scan
     debug_ocr: bool = False  # Save OCR crop images for debugging
 
 
@@ -214,7 +216,7 @@ class PipelineWorker(QtCore.QThread):
             try:
                 if self._settings.translator_backend == "GGUF":
                     from app.translate.gguf_client import GGUFClient
-                    n_gpu_layers = self._settings.gguf_n_gpu_layers if self._settings.use_gpu else 0
+                    n_gpu_layers = self._settings.gguf_n_gpu_layers
                     # Auto-detect prompt style from filename if generic settings used
                     prompt_style = self._settings.gguf_prompt_style
                     if "sakura" in self._settings.gguf_model_path.lower() and prompt_style == "qwen":
@@ -228,7 +230,7 @@ class PipelineWorker(QtCore.QThread):
                         n_threads=self._settings.gguf_n_threads,
                         n_batch=self._settings.gguf_n_batch,
                     )
-                    if self._settings.use_gpu and not getattr(ollama, "gpu_offload", True):
+                    if n_gpu_layers != 0 and not getattr(ollama, "gpu_offload", True):
                         self.message.emit(
                             "GGUF is running in CPU mode. For speed, install a CUDA-enabled llama-cpp-python "
                             "build or switch to Ollama."
@@ -472,9 +474,7 @@ class PipelineWorker(QtCore.QThread):
                                         discovery_client = ollama
                                     else:
                                         from app.translate.gguf_client import GGUFClient
-                                        n_gpu_layers = self._settings.gguf_n_gpu_layers if self._settings.use_gpu else 0
-                                        if n_gpu_layers == -1:
-                                            n_gpu_layers = 0
+                                        n_gpu_layers = self._settings.gguf_n_gpu_layers
                                         created_client = GGUFClient(
                                             model_path=target_path,
                                             prompt_style="extract",
@@ -701,9 +701,7 @@ class DeepScanWorker(QtCore.QThread):
                     return
                 if discovery_model and os.path.isfile(discovery_model):
                     from app.translate.gguf_client import GGUFClient
-                    n_gpu_layers = self.settings.gguf_n_gpu_layers if self.settings.use_gpu else 0
-                    if n_gpu_layers == -1:
-                        n_gpu_layers = 0
+                    n_gpu_layers = self.settings.gguf_n_gpu_layers
                     ollama = GGUFClient(
                         model_path=discovery_model,
                         prompt_style="extract",
@@ -1054,14 +1052,13 @@ def _process_page(
         return []
     image_size = _get_image_size(image_path)
     page_image = _load_image_for_crop(image_path)
-    # Pass input_size if the detector supports it (ComicTextDetector)
-    if hasattr(detector, "detect"):
-        try:
-           detections = detector.detect(image_path, input_size=image_input_size)
-        except TypeError:
-           detections = _detect_with_scale(detector, image_path, image_size)
-    else:
-        detections = _detect_with_scale(detector, image_path, image_size)
+    detections = _detect_regions(
+        detector,
+        image_path,
+        image_size,
+        input_size=image_input_size,
+        use_gpu=bool(settings and settings.use_gpu),
+    )
         
     merge = getattr(detector, "merge_mode", "auto") != "none"
     groups = _merge_detections(detections, image_size, merge=merge)
@@ -1070,7 +1067,13 @@ def _process_page(
         groups = [{"bbox": _polygon_to_bbox(p), "polygons": [p], "conf": float(c or 0.0)} for p, c in detections]
     bubble_boxes = [g["bbox"] for g in groups]
     if background_detector is not None:
-        bg_detections = _detect_with_scale(background_detector, image_path, image_size)
+        bg_detections = _detect_regions(
+            background_detector,
+            image_path,
+            image_size,
+            input_size=image_input_size,
+            use_gpu=bool(settings and settings.use_gpu),
+        )
         for polygon, conf in bg_detections:
             try:
                 bbox = _polygon_to_bbox(polygon)
@@ -1103,32 +1106,17 @@ def _process_page(
             ocr_text, ocr_conf = _recognize_with_fallback(ocr_engine, crop, settings, bbox)
             if not ocr_text:
                 continue
-            if text_filter.should_ignore(ocr_text, "background_text"):
-                # Skip SFX entirely (do not add region / do not mark needs_review)
-                # UNLESS it's valid Japanese dialogue (override filter)
-                if _is_valid_japanese(ocr_text) < 0.6:
-                    continue
-            
-            glossary_texts.append(ocr_text)
-            
-            if _should_skip_text(ocr_text, bbox, image_size):
-                regions.append(
-                    _region_record(
-                        idx,
-                        polygons,
-                        bbox,
-                        ocr_text,
-                        "",
-                        det_conf,
-                        bg_text=True,
-                        needs_review=True,
-                        ignore=True,
-                        font_name=font_name,
-                        region_type="background_text",
-                        ocr_conf=ocr_conf,
-                    )
-                )
-                continue
+            region_type, semantic_bg, semantic_ignore, semantic_review, render_updates = _classify_semantic_region(
+                ocr_text,
+                bbox,
+                image_size,
+                det_conf,
+                ocr_conf,
+                page_image,
+                text_filter,
+                initial_bg=True,
+            )
+            skip_text = _should_skip_text(ocr_text, bbox, image_size) if semantic_bg else False
             region = _region_record(
                 idx,
                 polygons,
@@ -1136,14 +1124,18 @@ def _process_page(
                 ocr_text,
                 "",
                 det_conf,
-                bg_text=True,
-                needs_review=False,
-                ignore=False,
+                bg_text=semantic_bg,
+                needs_review=semantic_review or skip_text,
+                ignore=semantic_ignore or skip_text,
                 font_name=font_name,
-                region_type="background_text",
+                region_type=region_type,
                 ocr_conf=ocr_conf,
+                render_updates=render_updates,
             )
             regions.append(region)
+            if region.get("ignore"):
+                continue
+            glossary_texts.append(ocr_text)
             cached = translation_cache.get(ocr_text)
             if cached is not None:
                 region["translation"] = cached
@@ -1164,16 +1156,18 @@ def _process_page(
             ocr_text, ocr_conf = _recognize_with_fallback(ocr_engine, crop, settings, bbox)
             if not ocr_text:
                 continue
-            if text_filter.should_ignore(ocr_text, "background_text"):
-                # Skip SFX entirely (do not add region / do not mark needs_review)
-                # UNLESS it's valid Japanese dialogue (override filter)
-                if _is_valid_japanese(ocr_text) < 0.6:
-                    continue
-            
-            glossary_texts.append(ocr_text)
-            
+            region_type, semantic_bg, semantic_ignore, semantic_review, render_updates = _classify_semantic_region(
+                ocr_text,
+                bbox,
+                image_size,
+                det_conf,
+                ocr_conf,
+                page_image,
+                text_filter,
+                initial_bg=bg_text,
+            )
             skip_text = _should_skip_text(ocr_text, bbox, image_size)
-            ignore = bool(filter_background and skip_text)
+            ignore = semantic_ignore or bool(filter_background and skip_text and semantic_bg)
             
             region = _region_record(
                 idx,
@@ -1182,16 +1176,18 @@ def _process_page(
                 ocr_text,
                 "",
                 det_conf,
-                bg_text=bg_text,
-                needs_review=needs_review or skip_text,
+                bg_text=semantic_bg,
+                needs_review=needs_review or semantic_review or skip_text,
                 ignore=ignore,
                 font_name=font_name,
-                region_type="background_text",
+                region_type=region_type,
                 ocr_conf=ocr_conf,
+                render_updates=render_updates,
             )
             regions.append(region)
             if ignore:
                 continue
+            glossary_texts.append(ocr_text)
             cached = translation_cache.get(ocr_text)
             if cached is not None:
                 region["translation"] = cached
@@ -1203,6 +1199,38 @@ def _process_page(
             continue
         ocr_text, ocr_conf = _recognize_with_fallback(ocr_engine, crop, settings, bbox)
         if not ocr_text:
+            continue
+        region_type, semantic_bg, semantic_ignore, semantic_review, render_updates = _classify_semantic_region(
+            ocr_text,
+            bbox,
+            image_size,
+            det_conf,
+            ocr_conf,
+            page_image,
+            text_filter,
+            initial_bg=False,
+        )
+        if region_type == "speech_bubble" and _should_ignore_speech_fragment(ocr_text, bbox, image_size, ocr_conf):
+            semantic_ignore = True
+            semantic_review = True
+        if semantic_ignore:
+            regions.append(
+                _region_record(
+                    idx,
+                    polygons,
+                    bbox,
+                    ocr_text,
+                    "",
+                    det_conf,
+                    bg_text=semantic_bg,
+                    needs_review=True,
+                    ignore=True,
+                    font_name=font_name,
+                    region_type=region_type,
+                    ocr_conf=ocr_conf,
+                    render_updates=render_updates,
+                )
+            )
             continue
         glossary_texts.append(ocr_text)
         # REMOVED: _should_skip_text filter for speech bubbles
@@ -1228,12 +1256,13 @@ def _process_page(
             ocr_text,
             "",
             det_conf,
-            bg_text=False,  # Speech bubble, not background
-            needs_review=needs_review,
-            ignore=False,   # NEVER ignore speech bubbles
+            bg_text=semantic_bg,
+            needs_review=needs_review or semantic_review,
+            ignore=False,
             font_name=font_name,
-            region_type="speech_bubble",
+            region_type=region_type,
             ocr_conf=ocr_conf,
+            render_updates=render_updates,
         )
         if detected_font:
             if target_lang == "Simplified Chinese" and not _is_font_allowed_for_cn(detected_font):
@@ -1292,6 +1321,11 @@ def _process_page(
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write("  -> SKIPPED: glossary_texts is EMPTY\n")
     if pending_texts:
+        prompt_style_guide = _build_page_style_guide(
+            active_style_guide,
+            list(pending_texts.keys()),
+        )
+        context_lines = _recent_context_lines(context_window)
         items = []
         id_to_text: dict[str, str] = {}
         for idx, text in enumerate(pending_texts.keys()):
@@ -1303,8 +1337,9 @@ def _process_page(
             model,
             source_lang,
             target_lang,
-            active_style_guide,
+            prompt_style_guide,
             items,
+            context_lines=context_lines,
             settings=settings,
         )
         text_to_translation: dict[str, str] = {}
@@ -1322,8 +1357,9 @@ def _process_page(
                     model,
                     source_lang,
                     target_lang,
-                    active_style_guide,
+                    prompt_style_guide,
                     text,
+                    context_lines=context_lines,
                     settings=settings,
                 )
                 # Apply glossary enforcement
@@ -1390,6 +1426,104 @@ def _resolve_model(model: str) -> str:
             return models[0]
         return "aya:35b"
     return model
+
+
+def _recent_context_lines(context_window: list, max_lines: int = 6) -> list[str]:
+    if not context_window:
+        return []
+    return [str(line).strip() for line in context_window[-max_lines:] if str(line).strip()]
+
+
+def _iter_character_sources(entry: dict) -> Iterable[str]:
+    if not isinstance(entry, dict):
+        return []
+    values = []
+    for key in ("original", "canonical", "name"):
+        value = str(entry.get(key, "")).strip()
+        if value:
+            values.append(value)
+    for alias in entry.get("aliases", []) or []:
+        if isinstance(alias, dict):
+            value = str(alias.get("source", "")).strip()
+        else:
+            value = str(alias).strip()
+        if value:
+            values.append(value)
+    return values
+
+
+def _match_count(texts: list[str], term: str) -> int:
+    if not term:
+        return 0
+    return sum(1 for text in texts if _contains_term(text, term))
+
+
+def _build_page_style_guide(
+    style_guide: dict,
+    source_texts: Iterable[str],
+    max_glossary: int = 24,
+    max_characters: int = 10,
+) -> dict:
+    if not isinstance(style_guide, dict):
+        return default_style_guide()
+
+    texts = [str(text).strip() for text in source_texts if str(text).strip()]
+    if not texts:
+        return style_guide
+
+    glossary = style_guide.get("glossary", []) or []
+    characters = style_guide.get("characters", []) or []
+    if len(glossary) <= max_glossary and len(characters) <= max_characters:
+        return style_guide
+
+    selected_glossary = list(glossary) if len(glossary) <= max_glossary else []
+    glossary_candidates = []
+    if len(glossary) > max_glossary:
+        for item in glossary:
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source", "")).strip()
+            target = str(item.get("target", "")).strip()
+            if not source or not target:
+                continue
+            match_count = _match_count(texts, source)
+            if match_count <= 0:
+                continue
+            priority = str(item.get("priority", "")).strip().lower()
+            score = (1000 if priority == "hard" else 0) + (match_count * 100) + len(source)
+            glossary_candidates.append((score, item))
+        glossary_candidates.sort(key=lambda pair: pair[0], reverse=True)
+        seen_sources = set()
+        for _, item in glossary_candidates:
+            source = str(item.get("source", "")).strip()
+            if source and source not in seen_sources:
+                selected_glossary.append(item)
+                seen_sources.add(source)
+            if len(selected_glossary) >= max_glossary:
+                break
+
+    selected_characters = list(characters) if len(characters) <= max_characters else []
+    character_candidates = []
+    if len(characters) > max_characters:
+        for raw_entry in characters:
+            entry = _normalize_character_entry(raw_entry)
+            if not entry:
+                continue
+            score = 0
+            for source in _iter_character_sources(entry):
+                score += _match_count(texts, source) * 100
+                score += len(source)
+            if score <= 0:
+                continue
+            character_candidates.append((score, entry))
+        character_candidates.sort(key=lambda pair: pair[0], reverse=True)
+        for _, entry in character_candidates[:max_characters]:
+            selected_characters.append(entry)
+
+    filtered = dict(style_guide)
+    filtered["glossary"] = selected_glossary
+    filtered["characters"] = selected_characters
+    return filtered
 
 
 def _polygon_to_bbox(polygon: list) -> list:
@@ -1815,6 +1949,37 @@ def _sanitize_glossary_target(target: str, source: str, target_lang: str) -> str
     if target_lang in ["Simplified Chinese", "Traditional Chinese"]:
         if not _language_ok(target_lang, cleaned):
             return ""
+        if _is_cjk_term(source) and _is_cjk_term(cleaned):
+            digit_chars = set("0123456789０１２３４５６７８９一二三四五六七八九十百千万亿兩两")
+            if not any(ch in digit_chars for ch in source) and any(ch in digit_chars for ch in cleaned):
+                return ""
+            extra_len = len(cleaned) - len(source)
+            if len(source) <= 3 and extra_len >= 3:
+                expansion_markers = (
+                    "这里",
+                    "那边",
+                    "这个",
+                    "那个",
+                    "这些",
+                    "那些",
+                    "二楼",
+                    "一楼",
+                    "三楼",
+                    "四楼",
+                    "楼",
+                    "习惯",
+                    "地方",
+                    "浴场",
+                    "学园",
+                    "学生",
+                    "少女",
+                    "休息",
+                    "休息场",
+                    "场",
+                    "家",
+                )
+                if any(marker in cleaned for marker in expansion_markers):
+                    return ""
     return cleaned
 
 
@@ -2184,7 +2349,7 @@ def _trigger_discovery_if_needed(
                     logger.info("Deep Scan: Swapping GGUF models to avoid dual load.")
                     ollama.close()
                 logger.info(f"Deep Scan: Loading specialized GGUF model: {target_path}")
-                n_gpu_layers = settings.gguf_n_gpu_layers if settings and settings.use_gpu else 0
+                n_gpu_layers = settings.gguf_n_gpu_layers if settings else 0
                 discovery_client = GGUFClient(
                     model_path=target_path,
                     prompt_style="extract",
@@ -2250,7 +2415,7 @@ def _trigger_discovery_if_needed(
                  if target_path and os.path.isfile(target_path):
                      try:
                          from app.translate.gguf_client import GGUFClient
-                         n_gpu_layers = settings.gguf_n_gpu_layers if settings.use_gpu else 0
+                         n_gpu_layers = settings.gguf_n_gpu_layers
                          state["translation_client"] = GGUFClient(
                              model_path=target_path,
                              prompt_style=settings.gguf_prompt_style,
@@ -2749,6 +2914,7 @@ def _batch_translate(
     target_lang: str,
     style_guide: dict,
     items: list,
+    context_lines: list[str] | None = None,
     settings: PipelineSettings | None = None,
 ) -> dict:
     resolved = _resolve_model(model)
@@ -2766,10 +2932,16 @@ def _batch_translate(
              temp = settings.ollama_temperature
              top_p = settings.ollama_top_p
              
-    batch_size = 8
+    batch_size = 16
     for start in range(0, len(items), batch_size):
         chunk = items[start : start + batch_size]
-        prompt = build_batch_translation_prompt(source_lang, target_lang, style_guide, chunk)
+        prompt = build_batch_translation_prompt(
+            source_lang,
+            target_lang,
+            style_guide,
+            chunk,
+            context_lines=context_lines,
+        )
         token_limit = _estimate_num_predict(chunk)
         try:
             raw = ollama.generate(
@@ -2797,8 +2969,8 @@ def _estimate_num_predict(items: list) -> int:
     if not items:
         return 128
     lengths = [len(str(item.get("text", ""))) for item in items if isinstance(item, dict)]
-    avg_len = sum(lengths) / max(1, len(lengths))
-    estimate = int(max(64, min(160, avg_len * 5)))
+    total_len = sum(lengths)
+    estimate = int(max(128, min(512, total_len * 3 + len(lengths) * 12)))
     return estimate
 
 
@@ -2809,9 +2981,16 @@ def _translate_single(
     target_lang: str,
     style_guide: dict,
     text: str,
+    context_lines: list[str] | None = None,
     settings: PipelineSettings | None = None,
 ) -> str:
-    prompt = build_translation_prompt(source_lang, target_lang, style_guide, [], text)
+    prompt = build_translation_prompt(
+        source_lang,
+        target_lang,
+        style_guide,
+        context_lines or [],
+        text,
+    )
     
     # Defaults
     temp = 0.2
@@ -2857,7 +3036,9 @@ def _ensure_target_language(
     translation: str,
     is_bubble: bool = False,
 ) -> tuple[str, bool]:
-    if _too_long_translation(translation, ocr_text):
+    if _looks_like_merged_batch_output(translation, ocr_text):
+        translation = _translate_strict(ollama, model, source_lang, target_lang, ocr_text)
+    elif _too_long_translation(translation, ocr_text):
         translation = _translate_brief(ollama, model, source_lang, target_lang, ocr_text)
     if _looks_like_prompt_leak(translation):
         translation = _translate_strict(ollama, model, source_lang, target_lang, ocr_text)
@@ -2922,11 +3103,26 @@ def _ensure_target_language(
 def _too_long_translation(translation: str, ocr_text: str) -> bool:
     if not translation or not ocr_text:
         return False
+    if "\n" in translation:
+        return True
     t_len = len(translation)
     o_len = len(ocr_text)
     if o_len <= 4:
         return t_len > max(12, o_len * 3)
     return t_len > o_len * 2.2
+
+
+def _looks_like_merged_batch_output(translation: str, ocr_text: str) -> bool:
+    if not translation:
+        return False
+    lines = [line.strip() for line in str(translation).splitlines() if line.strip()]
+    if len(lines) >= 2:
+        return True
+    src_punct = sum(1 for ch in ocr_text if ch in "。！？!?…")
+    dst_punct = sum(1 for ch in translation if ch in "。！？!?…")
+    if dst_punct >= max(3, src_punct + 3) and len(translation) > max(24, len(ocr_text) * 1.6):
+        return True
+    return False
 
 
 def _translate_brief(
@@ -3094,6 +3290,218 @@ def _should_skip_text(text: str, bbox: list, image_size: tuple[int, int]) -> boo
     return False
 
 
+def _should_ignore_speech_fragment(
+    text: str,
+    bbox: list,
+    image_size: tuple[int, int],
+    ocr_conf: float,
+) -> bool:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return True
+    if _is_punct_only(cleaned):
+        return True
+    if _placeholder_ratio(cleaned) >= 0.2:
+        return True
+    img_w, img_h = image_size
+    page_area = max(1, img_w * img_h)
+    _, _, w, h = bbox
+    area_ratio = (max(1, w) * max(1, h)) / page_area
+    kana_only = all(_is_kana(ch) or ch in {"ー", "・"} for ch in cleaned)
+    narrow_box = min(max(1, w), max(1, h)) <= 42
+    if len(cleaned) == 1:
+        if kana_only and area_ratio < 0.0035 and ocr_conf < 0.985:
+            return True
+        if cleaned in {"っ", "ッ", "ー", "・"}:
+            return True
+    if len(cleaned) == 2 and kana_only and area_ratio < 0.0025 and ocr_conf < 0.96:
+        return True
+    if len(cleaned) == 3 and kana_only and narrow_box and area_ratio < 0.0015 and ocr_conf < 0.93:
+        return True
+    if len(cleaned) <= 3 and kana_only and narrow_box and area_ratio < 0.0009 and ocr_conf < 0.985:
+        return True
+    return False
+
+
+def _classify_semantic_region(
+    text: str,
+    bbox: list,
+    image_size: tuple[int, int],
+    det_conf: float,
+    ocr_conf: float,
+    image_obj,
+    text_filter: TextFilter,
+    initial_bg: bool = False,
+) -> tuple[str, bool, bool, bool, dict]:
+    cleaned = str(text or "").strip()
+    region_type = "background_text" if initial_bg else "speech_bubble"
+    bg_text = bool(initial_bg)
+    needs_review = det_conf < 0.6
+    render_updates: dict[str, object] = {}
+
+    if not cleaned:
+        return region_type, bg_text, True, True, render_updates
+
+    stats = _box_luma_stats_pil(image_obj, bbox)
+    _, _, w, h = bbox
+    aspect = w / max(1, h)
+    thin_strip = h <= 28 and aspect >= 3.0
+    katakana_ratio = _katakana_ratio_text(cleaned)
+    contains_kanji = any(0x4E00 <= ord(ch) <= 0x9FFF for ch in cleaned)
+    mixed_scripts = _has_mixed_scripts(cleaned)
+    has_latin = _has_latin_text(cleaned)
+
+    if _looks_like_decorative_title_artifact(
+        cleaned,
+        bbox,
+        image_size,
+        det_conf,
+        ocr_conf,
+        mixed_scripts,
+        has_latin,
+    ):
+        return "background_text", True, True, True, render_updates
+
+    if _is_dark_caption_box(stats, cleaned):
+        region_type = "background_text"
+        bg_text = True
+        render_updates = {"color": "#FFFFFF", "stroke": "#000000", "stroke_width": 1}
+
+    if thin_strip and not bg_text:
+        region_type = "background_text"
+        bg_text = True
+
+    if bg_text:
+        if text_filter.should_ignore(cleaned, "background_text"):
+            if not contains_kanji or katakana_ratio >= 0.6 or len(cleaned) <= 6:
+                return region_type, bg_text, True, True, render_updates
+        if _looks_like_background_artifact(cleaned, bbox, image_size, det_conf, ocr_conf, mixed_scripts):
+            return region_type, bg_text, True, True, render_updates
+        return region_type, bg_text, False, needs_review, render_updates
+
+    if text_filter.should_ignore(cleaned, "speech_bubble") and _likely_sfx_effect_box(
+        cleaned, bbox, image_size, ocr_conf
+    ):
+        return region_type, bg_text, True, True, render_updates
+
+    return region_type, bg_text, False, needs_review, render_updates
+
+
+def _box_luma_stats_pil(image_obj, bbox: list):
+    if image_obj is None or not bbox:
+        return None
+    try:
+        from PIL import ImageStat
+    except Exception:
+        return None
+    try:
+        img_w, img_h = image_obj.size
+        x, y, w, h = [int(v) for v in bbox[:4]]
+        x0 = max(0, min(x, img_w - 1))
+        y0 = max(0, min(y, img_h - 1))
+        x1 = max(x0 + 1, min(x + max(1, w), img_w))
+        y1 = max(y0 + 1, min(y + max(1, h), img_h))
+        crop = image_obj.crop((x0, y0, x1, y1)).convert("L")
+        stat = ImageStat.Stat(crop)
+        extrema = crop.getextrema()
+        if not stat.mean or extrema is None:
+            return None
+        return float(stat.mean[0]), int(extrema[0]), int(extrema[1])
+    except Exception:
+        return None
+
+
+def _is_dark_caption_box(stats, text: str) -> bool:
+    if not stats or len(text) < 2:
+        return False
+    mean, low, high = stats
+    if high >= 190:
+        return False
+    return mean < 125 and low < 110
+
+
+def _katakana_ratio_text(text: str) -> float:
+    if not text:
+        return 0.0
+    count = sum(1 for ch in text if 0x30A0 <= ord(ch) <= 0x30FF)
+    return count / max(1, len(text))
+
+
+def _has_mixed_scripts(text: str) -> bool:
+    has_hira = any(0x3040 <= ord(ch) <= 0x309F for ch in text)
+    has_kata = any(0x30A0 <= ord(ch) <= 0x30FF for ch in text)
+    has_kanji = any(0x4E00 <= ord(ch) <= 0x9FFF for ch in text)
+    return sum(1 for flag in (has_hira, has_kata, has_kanji) if flag) >= 3
+
+
+def _has_latin_text(text: str) -> bool:
+    return any(("A" <= ch <= "Z") or ("a" <= ch <= "z") for ch in str(text or ""))
+
+
+def _looks_like_decorative_title_artifact(
+    text: str,
+    bbox: list,
+    image_size: tuple[int, int],
+    det_conf: float,
+    ocr_conf: float,
+    mixed_scripts: bool,
+    has_latin: bool,
+) -> bool:
+    if not text:
+        return False
+    if any(ch in text for ch in "。！？!?"):
+        return False
+    has_cjk = any(_is_cjk_char(ch) for ch in str(text or ""))
+    _, _, w, h = bbox
+    page_area = max(1, image_size[0] * image_size[1])
+    area_ratio = (max(1, w) * max(1, h)) / page_area
+    large_box = area_ratio >= 0.012 or (max(w, h) >= min(image_size) * 0.22)
+    if has_latin and has_cjk and large_box:
+        return True
+    if has_latin and mixed_scripts and large_box:
+        return True
+    if has_latin and area_ratio >= 0.006 and ocr_conf < 0.995 and det_conf >= 0.85:
+        return True
+    return False
+
+
+def _looks_like_background_artifact(
+    text: str,
+    bbox: list,
+    image_size: tuple[int, int],
+    det_conf: float,
+    ocr_conf: float,
+    mixed_scripts: bool,
+) -> bool:
+    _, _, w, h = bbox
+    page_area = max(1, image_size[0] * image_size[1])
+    area_ratio = (max(1, w) * max(1, h)) / page_area
+    thin_strip = h <= 28 and w >= h * 3.0
+    if thin_strip and mixed_scripts and ocr_conf < 0.95:
+        return True
+    if thin_strip and len(text) <= 8 and det_conf >= 0.95 and ocr_conf < 0.92:
+        return True
+    if area_ratio < 0.001 and _placeholder_ratio(text) > 0.0:
+        return True
+    return False
+
+
+def _likely_sfx_effect_box(
+    text: str,
+    bbox: list,
+    image_size: tuple[int, int],
+    ocr_conf: float,
+) -> bool:
+    if any(ch in text for ch in "、。！？!?…"):
+        return False
+    _, _, w, h = bbox
+    page_area = max(1, image_size[0] * image_size[1])
+    area_ratio = (max(1, w) * max(1, h)) / page_area
+    short = len(text) <= 6
+    mostly_katakana = _katakana_ratio_text(text) >= 0.6
+    return short and mostly_katakana and (min(w, h) <= 60 or area_ratio < 0.003) and ocr_conf < 0.995
+
+
 def _japanese_ratio(text: str) -> float:
     if not text:
         return 0.0
@@ -3192,7 +3600,20 @@ def _region_record(
     font_name: str,
     region_type: str = "speech_bubble",
     ocr_conf: float = 1.0,
+    render_updates: dict | None = None,
 ) -> dict:
+    render = {
+        "font": font_name,
+        "font_size": 0,
+        "line_height": 1.2,
+        "align": "center",
+        "color": "#000000",
+        "stroke": "#FFFFFF",
+        "stroke_width": 2,
+        "wrap_mode": "auto",
+    }
+    if isinstance(render_updates, dict):
+        render.update({k: v for k, v in render_updates.items() if v is not None})
     return {
         "region_id": f"r{idx:03d}",
         "bbox": bbox,
@@ -3201,16 +3622,7 @@ def _region_record(
         "ocr_text": ocr_text,
         "translation": translation,
         "confidence": {"det": det_conf, "ocr": ocr_conf, "trans": 1.0},
-        "render": {
-            "font": font_name,
-            "font_size": 0,
-            "line_height": 1.2,
-            "align": "center",
-            "color": "#000000",
-            "stroke": "#FFFFFF",
-            "stroke_width": 2,
-            "wrap_mode": "auto",
-        },
+        "render": render,
         "flags": {"ignore": ignore, "bg_text": bg_text, "needs_review": needs_review},
     }
 
@@ -3276,6 +3688,50 @@ def _detect_with_scale(detector, image_path: str, image_size: tuple[int, int], t
             scaled.append((_scale_polygon(polygon, inv), conf))
         return scaled
     return detections
+
+
+def _get_detector_fallback(detector, use_gpu: bool):
+    fallback = getattr(detector, "_runtime_fallback_detector", None)
+    if fallback is not None:
+        return fallback
+    from app.detect.paddle_detector import PaddleTextDetector
+
+    fallback = PaddleTextDetector(use_gpu)
+    setattr(detector, "_runtime_fallback_detector", fallback)
+    return fallback
+
+
+def _detect_regions(
+    detector,
+    image_path: str,
+    image_size: tuple[int, int],
+    input_size: int = 1024,
+    use_gpu: bool = False,
+    message_callback=None,
+):
+    if getattr(detector, "_runtime_fallback_active", False):
+        fallback = _get_detector_fallback(detector, use_gpu)
+        return _detect_with_scale(fallback, image_path, image_size, target_long=input_size)
+    try:
+        if hasattr(detector, "detect"):
+            try:
+                return detector.detect(image_path, input_size=input_size)
+            except TypeError:
+                return _detect_with_scale(detector, image_path, image_size, target_long=input_size)
+        return _detect_with_scale(detector, image_path, image_size, target_long=input_size)
+    except Exception as exc:
+        detector_name = detector.__class__.__name__
+        if detector_name != "ComicTextDetector":
+            raise
+        logger.warning("Detector failed on %s with %s. Falling back to PaddleTextDetector.", image_path, exc)
+        if message_callback is not None:
+            try:
+                message_callback(f"ComicTextDetector failed on {os.path.basename(image_path)}; using Paddle fallback.")
+            except Exception:
+                pass
+        fallback = _get_detector_fallback(detector, use_gpu)
+        setattr(detector, "_runtime_fallback_active", True)
+        return _detect_with_scale(fallback, image_path, image_size, target_long=input_size)
 
 
 def _classify_region(

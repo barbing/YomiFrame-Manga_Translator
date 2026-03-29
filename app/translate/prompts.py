@@ -21,6 +21,10 @@ def build_translation_prompt(
     if target_lang == "Simplified Chinese":
         lines = [
             "将以下日文翻译成简体中文，只输出译文。",
+            "译文要像中文漫画对白，自然、简洁，不要照搬日语语序。",
+            "不要擅自补充主语、解释、旁白或额外句子。",
+            "人名和称呼优先遵循术语表；敬语请用自然中文处理，不要生硬直译。",
+            "长度尽量接近原文，避免过度扩写。",
         ]
         if guide_text:
             lines.append(f"风格：{guide_text}")
@@ -62,12 +66,14 @@ def build_batch_translation_prompt(
     target_lang: str,
     style_guide: Dict[str, object],
     items: List[Dict[str, str]],
+    context_lines: List[str] | None = None,
 ) -> str:
     guide_text = str(style_guide.get("notes", "")).strip()
     glossary = _format_glossary(style_guide.get("glossary", []))
     characters = _format_characters(style_guide.get("characters", []))
     required_terms = _format_list(style_guide.get("required_terms", []))
     forbidden_terms = _format_list(style_guide.get("forbidden_terms", []))
+    context = "\n".join(context_lines or []).strip()
     payload = json.dumps(items, ensure_ascii=False)
     if target_lang == "Simplified Chinese":
         lines = [
@@ -75,6 +81,9 @@ def build_batch_translation_prompt(
             "JSON格式：[{\"id\":\"...\",\"translation\":\"...\"}]，仅翻译text字段，保持条目顺序。",
             "注意：以下文本为同一页漫画的连续对话，请保持语境连贯和人称一致。",
             "拟声词或背景杂字可返回空字符串。",
+            "译文要像中文漫画对白，简洁自然，不要照搬日语语序。",
+            "不要擅自补充主语、说明或额外句子。",
+            "人名和称呼优先遵循术语表；敬语请用自然中文处理。",
         ]
         if guide_text:
             lines.append(f"风格：{guide_text}")
@@ -86,6 +95,8 @@ def build_batch_translation_prompt(
             lines.append(f"必须使用：{required_terms}")
         if forbidden_terms:
             lines.append(f"禁止使用：{forbidden_terms}")
+        if context:
+            lines.append(f"参考上下文：{context}")
         lines.append(f"输入：{payload}")
         return "\n".join(lines)
     lines = [
@@ -103,6 +114,8 @@ def build_batch_translation_prompt(
         lines.append(f"Required terms: {required_terms}")
     if forbidden_terms:
         lines.append(f"Forbidden terms: {forbidden_terms}")
+    if context:
+        lines.append(f"Context (reference only): {context}")
     lines.append(f"Input: {payload}")
     return "\n".join(lines)
 

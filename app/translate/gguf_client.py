@@ -6,6 +6,7 @@ import os
 import struct
 import threading
 from typing import Optional
+import json
 
 import logging
 
@@ -108,6 +109,37 @@ def _read_gguf_architecture(model_path: str) -> str:
     except Exception:
         return ""
     return ""
+
+
+def _parse_glossary_response(text: str) -> dict[str, str]:
+    clean_response = str(text or "").strip()
+    if not clean_response:
+        return {}
+
+    start = clean_response.find("{")
+    end = clean_response.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = clean_response[start : end + 1]
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return {str(k).strip(): str(v).strip() for k, v in parsed.items()}
+        except json.JSONDecodeError:
+            pass
+
+    merged = {}
+    for line in clean_response.splitlines():
+        line = line.strip().rstrip(",")
+        if not line or not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            for key, value in parsed.items():
+                merged[str(key).strip()] = str(value).strip()
+    return merged
 
 
 @lru_cache(maxsize=2)
@@ -311,43 +343,14 @@ class GGUFClient:
                     options={"num_predict": 1024, "temperature": 0.1}
                 )
                 
-                # Parse JSON
-                # Parse JSON with robust recovery
-                import json
-                import re
-                
-                clean_response = response.strip()
-                
-                # 1. Try to find JSON block using simple outer brace matching
-                # Python re doesn't support recursion (?R), so we use find/rfind
-                start = clean_response.find('{')
-                end = clean_response.rfind('}')
-                
-                chunk_map = {}
-                success = False
-                
-                if start != -1 and end != -1 and end > start:
-                    potential_json = clean_response[start:end+1]
-                    try:
-                        chunk_map = json.loads(potential_json)
-                        success = True
-                    except json.JSONDecodeError:
-                        # Try to clean up common issues like trailing commas
-                        try:
-                            # Remove trailing commas before }
-                            fixed_json = re.sub(r',(\s*\})', r'\1', potential_json)
-                            chunk_map = json.loads(fixed_json)
-                            success = True
-                        except:
-                            pass
-                
-                if success and isinstance(chunk_map, dict):
+                chunk_map = _parse_glossary_response(response)
+                if chunk_map:
                     results.update(chunk_map)
                 else:
-                    logger.warning(f"Failed to parse glossary JSON: {clean_response[:50]}...")
+                    logger.warning(f"Failed to parse glossary JSON: {str(response)[:50]}...")
                     # Fallback: simple line parsing (Key: Value or Key=Value)
                     # This catches Sakura's tendency to output "Src=Tgt" lines if strict JSON fails
-                    for line in clean_response.split('\n'):
+                    for line in str(response).split('\n'):
                         if ':' in line:
                             parts = line.split(':', 1)
                             if len(parts) == 2:

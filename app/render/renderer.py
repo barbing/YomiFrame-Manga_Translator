@@ -36,7 +36,18 @@ def render_translations(
         img = img.convert("RGB")
         working = img
         img_w, img_h = img.size
-        render_regions: List[Tuple[str, Tuple[int, int, int, int], str, Tuple[int, int, int] | None]] = []
+        render_regions: List[
+            Tuple[
+                str,
+                Tuple[int, int, int, int],
+                str,
+                Tuple[int, int, int] | None,
+                int,
+                Tuple[int, int, int] | None,
+                float,
+                int,
+            ]
+        ] = []
         background_boxes: List[Tuple[Tuple[int, int, int, int], Tuple[int, int, int] | None]] = []
         text_mask = None
         bubble_text_mask = None
@@ -147,14 +158,36 @@ def render_translations(
                         )
                     )
             else:
-                render_box = _shrink_box(render_box, max(2, int(min(w, h) * 0.03)))
+                shrink = max(2, int(min(w, h) * 0.03))
+                if region_type == "speech_bubble" and min(w, h) <= 40:
+                    shrink = 1
+                render_box = _shrink_box(render_box, shrink)
             render = region.get("render") or {}
             if not isinstance(render, dict):
                 render = {}
             region_font = render.get("font") or font_name
             if _has_cjk(text) and _is_cjk_unsupported_font(region_font):
                 region_font = font_name
-            render_regions.append((text, render_box, region_font, forced_color))
+            configured_color = _parse_color(render.get("color"))
+            stroke_width = max(0, int(render.get("stroke_width", 0) or 0))
+            stroke_color = _parse_color(render.get("stroke"))
+            line_height = max(0.82, min(1.2, float(render.get("line_height", 1.0) or 1.0)))
+            font_size_override = max(0, int(render.get("font_size", 0) or 0))
+            if min(w, h) <= 40:
+                stroke_width = min(stroke_width, 1)
+            effective_color = forced_color or configured_color
+            render_regions.append(
+                (
+                    text,
+                    render_box,
+                    region_font,
+                    effective_color,
+                    stroke_width,
+                    stroke_color,
+                    line_height,
+                    font_size_override,
+                )
+            )
 
         if render_regions:
             # Combine background boxes into a single mask for inpainting
@@ -183,6 +216,8 @@ def render_translations(
                     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
                     bubble_area_mask = cv2.morphologyEx(bubble_area_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
                 working = _apply_bubble_fill(working, bubble_area_mask, bubble_text_mask, img_np)
+                if text_mask is not None:
+                    text_mask = cv2.bitwise_and(text_mask, cv2.bitwise_not(bubble_text_mask))
             
             # Now apply text removal for everything (including background text which is now in text_mask)
             if text_mask is not None and text_mask.any():
@@ -192,24 +227,43 @@ def render_translations(
         median_height = 0
         preferred_size = None
         if render_regions:
-            heights = sorted(max(1, box[3] - box[1]) for _, box, _, _ in render_regions)
+            heights = sorted(max(1, box[3] - box[1]) for _, box, _, _, _, _, _, _ in render_regions)
             median_height = heights[len(heights) // 2]
             preferred_size = max(12, int(median_height * 0.33))
-        for text, box, region_font, forced_color in render_regions:
+        for text, box, region_font, forced_color, stroke_width, stroke_color, line_height_scale, font_size_override in render_regions:
             x0, y0, x1, y1 = box
             w = max(1, x1 - x0)
             h = max(1, y1 - y0)
+            narrow_cjk = _has_cjk(text) and h > w * 1.6
+            if narrow_cjk:
+                line_height_scale = min(line_height_scale, 0.92)
             local_preferred = None
-            if preferred_size and h >= preferred_size * 2:
+            if font_size_override > 0:
+                local_preferred = font_size_override
+            elif preferred_size and h >= preferred_size * 2:
                 local_preferred = min(preferred_size, max(12, int(h * 0.7)))
-            base_font = _fit_font(draw, text, w, h, region_font, preferred_size=local_preferred)
+            if narrow_cjk:
+                width_cap = max(10, int(w * 1.05))
+                if local_preferred is None:
+                    local_preferred = width_cap
+                else:
+                    local_preferred = min(local_preferred, width_cap)
+            base_font = _fit_font(
+                draw,
+                text,
+                w,
+                h,
+                region_font,
+                preferred_size=local_preferred,
+                line_height_scale=line_height_scale,
+            )
             best_lines = _wrap_text(draw, text, base_font, w)
             best_font = base_font
-            best_height = sum(_text_height(base_font, line) for line in best_lines)
-            max_lines = max(1, min(6, int(h / max(1, _text_height(base_font, "A"))) + 1))
+            best_height = _measure_lines_height(base_font, best_lines, line_height_scale)
+            max_lines = max(1, min(8, int(h / max(1, int(_text_height(base_font, "A") * line_height_scale))) + 1))
             for lines_count in range(2, max_lines + 1):
                 test_lines = _wrap_text(draw, text, base_font, w, max_lines=lines_count)
-                test_height = sum(_text_height(base_font, line) for line in test_lines)
+                test_height = _measure_lines_height(base_font, test_lines, line_height_scale)
                 if test_height <= h and len(test_lines) > len(best_lines):
                     best_lines = test_lines
                     best_height = test_height
@@ -217,7 +271,7 @@ def render_translations(
                 for size in range(local_preferred - 1, 9, -1):
                     test_font = _load_font(_find_font_path(region_font), size, _sample_char(text))
                     test_lines = _wrap_text(draw, text, test_font, w, max_lines=max_lines)
-                    test_height = sum(_text_height(test_font, line) for line in test_lines)
+                    test_height = _measure_lines_height(test_font, test_lines, line_height_scale)
                     if test_height <= h:
                         best_font = test_font
                         best_lines = test_lines
@@ -230,8 +284,15 @@ def render_translations(
                 line_width = bbox[2] - bbox[0]
                 line_height = bbox[3] - bbox[1]
                 offset_x = x0 + max(0, (w - line_width) // 2) - bbox[0]
-                draw.text((offset_x, offset_y - bbox[1]), line, fill=fill_color, font=best_font)
-                offset_y += line_height
+                draw.text(
+                    (offset_x, offset_y - bbox[1]),
+                    line,
+                    fill=fill_color,
+                    font=best_font,
+                    stroke_width=stroke_width,
+                    stroke_fill=stroke_color,
+                )
+                offset_y += max(1, int(line_height * line_height_scale))
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         # Save with high quality to prevent JPEG compression artifacts
         ext = os.path.splitext(output_path)[1].lower()
@@ -536,7 +597,9 @@ def _apply_bubble_fill(image, bubble_mask, text_mask, reference_np):
         else:
             median = np.median(samples.reshape(-1, 3), axis=0)
             color = tuple(int(v) for v in median.tolist())
-        result[text_region > 0] = color
+        fill_region = cv2.dilate(text_region, kernel, iterations=2)
+        fill_region = cv2.bitwise_and(fill_region, component)
+        result[fill_region > 0] = color
     return Image.fromarray(result)
 
 
@@ -598,6 +661,18 @@ def _resolve_text_color(image, box, default=(0, 0, 0)):
     except Exception:
         return default
     return default
+
+
+def _parse_color(value) -> Tuple[int, int, int] | None:
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text.startswith("#") or len(text) != 7:
+        return None
+    try:
+        return tuple(int(text[i : i + 2], 16) for i in (1, 3, 5))
+    except Exception:
+        return None
 
 
 def _region_masks(
@@ -987,6 +1062,16 @@ def _text_height(font, text: str) -> int:
     return max(1, int(bbox[3] - bbox[1]))
 
 
+def _measure_lines_height(font, lines: List[str], line_height_scale: float = 1.0) -> int:
+    if not lines:
+        return 0
+    total = 0
+    for line in lines:
+        height = _text_height(font, line)
+        total += max(1, int(height * line_height_scale))
+    return total
+
+
 def _fill_padding(w: int, h: int) -> int:
     base = max(12, int(min(w, h) * 0.35), int(max(w, h) * 0.1))
     return min(base, 80)
@@ -1004,31 +1089,32 @@ def _fit_font(
     max_height: int,
     font_name: str,
     preferred_size: int | None = None,
+    line_height_scale: float = 1.0,
 ):
     font_path = _find_font_path(font_name)
     sample = _sample_char(text)
-    start_size = min(72, max(14, int(max_height * 0.75)))
-    min_size = max(10, int(max_height * 0.18))
+    start_size = min(72, max(12, int(min(max_height * 0.75, max_width * 1.15))))
+    min_size = max(8, int(min(max_height * 0.18, max_width * 0.55)))
     if preferred_size is not None:
         target = max(min_size, min(preferred_size, start_size))
         font = _load_font(font_path, target, sample)
         lines = _wrap_text(draw, text, font, max_width)
-        total_height = sum(font.getbbox(line)[3] for line in lines)
+        total_height = _measure_lines_height(font, lines, line_height_scale)
         if total_height <= max_height:
             return font
     for size in range(start_size, min_size - 1, -1):
         font = _load_font(font_path, size, sample)
         lines = _wrap_text(draw, text, font, max_width)
-        total_height = sum(font.getbbox(line)[3] for line in lines)
+        total_height = _measure_lines_height(font, lines, line_height_scale)
         if total_height <= max_height:
             return font
     for size in range(min_size - 1, 9, -1):
         font = _load_font(font_path, size, sample)
         lines = _wrap_text(draw, text, font, max_width)
-        total_height = sum(font.getbbox(line)[3] for line in lines)
+        total_height = _measure_lines_height(font, lines, line_height_scale)
         if total_height <= max_height:
             return font
-    return _load_font(font_path, 10, sample)
+    return _load_font(font_path, 8, sample)
 
 
 def _load_font(font_path: str | None, size: int, sample: str):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 import os
 from typing import List, Tuple
+from app.models.resolution import resolve_paddle_local_det_dir, resolve_paddle_system_det_dir
 
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
 os.environ.setdefault("FLAGS_enable_mkldnn", "0")
@@ -22,31 +23,7 @@ class PaddleTextDetector:
             paddle.set_flags({"FLAGS_use_mkldnn": 0, "FLAGS_enable_onednn": 0})
         except Exception:
             pass
-        # 1. System Check (Priority)
-        # If models exist in ~/.paddleocr, we let PaddleOCR use defaults (None)
-        use_system = False
-        try:
-             home = os.path.expanduser("~")
-             # Simple heuristic: check if ~/.paddleocr/whl exists and has files
-             if os.path.exists(os.path.join(home, ".paddleocr", "whl")):
-                 use_system = True
-        except Exception:
-             pass
-
-        det_model_dir = None
-        if not use_system:
-            # 2. Portable Fallback
-            # Note: We now use ch_PP-OCRv4_det_infer by default (same as downloader)
-            app_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            models_dir = os.path.join(app_root, "models")
-            
-            local_model_path_v4 = os.path.join(models_dir, "paddleocr", "ch_PP-OCRv4_det_infer")
-            local_model_path_v3 = os.path.join(models_dir, "paddleocr", "Multilingual_PP-OCRv3_det_infer")
-            
-            if os.path.exists(local_model_path_v4):
-                det_model_dir = local_model_path_v4
-            elif os.path.exists(local_model_path_v3):
-                det_model_dir = local_model_path_v3
+        det_model_dir = None if resolve_paddle_system_det_dir() else resolve_paddle_local_det_dir()
 
         self._detector = PaddleOCR(
             det_model_dir=det_model_dir,

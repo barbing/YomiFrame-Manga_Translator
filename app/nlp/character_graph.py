@@ -22,6 +22,53 @@ from collections import defaultdict
 logger = logging.getLogger(__name__)
 
 
+def _has_kanji(text: str) -> bool:
+    return any(0x4E00 <= ord(ch) <= 0x9FFF for ch in str(text or ""))
+
+
+def _is_kana_only(text: str) -> bool:
+    text = str(text or "")
+    return bool(text) and all(0x3040 <= ord(ch) <= 0x30FF for ch in text)
+
+
+def _has_honorific_suffix(text: str) -> bool:
+    text = str(text or "")
+    if not text:
+        return False
+    relaxed_variants = {
+        "さぁん": "さん",
+        "さあん": "さん",
+        "さーん": "さん",
+        "ちゃぁん": "ちゃん",
+        "ちゃあん": "ちゃん",
+        "ちゃーん": "ちゃん",
+        "くぅん": "くん",
+        "くうん": "くん",
+        "くーん": "くん",
+    }
+    relaxed = text
+    for variant, normalized in relaxed_variants.items():
+        if relaxed.endswith(variant):
+            relaxed = f"{relaxed[:-len(variant)]}{normalized}"
+            break
+    false_honorific_words = {
+        "みなさん",
+        "皆さん",
+        "たくさん",
+        "沢山",
+        "おじさん",
+        "オジサン",
+        "おばさん",
+        "オバサン",
+    }
+    if relaxed in false_honorific_words or relaxed.endswith(("みなさん", "皆さん", "たくさん", "沢山")):
+        return False
+    for suffix in ("さん", "くん", "ちゃん", "さま", "様", "先生", "先輩", "殿"):
+        if relaxed.endswith(suffix) and len(relaxed) > len(suffix):
+            return True
+    return False
+
+
 @dataclass
 class CharacterNode:
     """A character with their canonical name and all known aliases."""
@@ -157,6 +204,17 @@ class CharacterGraph:
         if len(node.context_sentences) < 5:  # Limit context
             node.context_sentences.append(sentence)
         return True
+
+    def _canonical_priority(self, canonical: str) -> tuple[int, int, int, int]:
+        node = self._nodes.get(canonical)
+        reading = getattr(node, "canonical_reading", "") if node else ""
+        return (
+            1 if _has_kanji(canonical) else 0,
+            0 if _has_honorific_suffix(canonical) else 1,
+            0 if _is_kana_only(canonical) else 1,
+            len(str(reading or "")),
+            len(str(canonical or "")),
+        )
     
     def auto_link_aliases(self, extracted_names: list) -> int:
         """
@@ -174,6 +232,11 @@ class CharacterGraph:
             Number of new links created
         """
         links_created = 0
+        surface_counts: Dict[str, int] = defaultdict(int)
+        for name in extracted_names:
+            surface = str(getattr(name, "surface", "") or "").strip()
+            if surface:
+                surface_counts[surface] += 1
         
         # Group by reading to find potential matches
         by_reading: Dict[str, List] = defaultdict(list)
@@ -186,7 +249,18 @@ class CharacterGraph:
                 continue
                 
             # Sort by surface length (longest is canonical)
-            sorted_names = sorted(names, key=lambda n: -len(n.surface))
+            sorted_names = sorted(
+                names,
+                key=lambda n: (
+                    1 if _has_kanji(n.surface) else 0,
+                    0 if _has_honorific_suffix(n.surface) else 1,
+                    0 if _is_kana_only(n.surface) else 1,
+                    surface_counts.get(str(n.surface or ""), 0),
+                    len(n.reading or ""),
+                    len(n.surface),
+                ),
+                reverse=True,
+            )
             canonical_name = sorted_names[0]
             
             # Add canonical if not exists
@@ -245,7 +319,7 @@ class CharacterGraph:
                         node2 = self._nodes.get(node2_name)
                         
                         if node1 and node2:
-                            if len(node1_name) > len(node2_name):
+                            if self._canonical_priority(node1_name) >= self._canonical_priority(node2_name):
                                 self.add_alias(node2_name, node1_name)
                                 links_created += 1
                             else:

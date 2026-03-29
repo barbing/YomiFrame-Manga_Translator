@@ -14,6 +14,7 @@ import logging
 import os
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
+from app.models.resolution import resolve_ner_local_dir, resolve_ner_system_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -65,55 +66,13 @@ class NERExtractor:
         self._available = False
         self._fallback_mecab = None
         
-        # Set up model directory
-        # Set up model directory (Logic: System > Portable)
-        # Note: We determine 'cache_dir' based on availability.
-        
-        # 1. System Check (Implicit)
-        # If we pass cache_dir=None, transformers uses the default system cache (~/.cache/huggingface...).
-        # We only set cache_dir if we want to force the portable path.
-        
-        # Check standard HF cache first
-        use_system = False
-        try:
-             # 1. System Check
-             hf_home = os.environ.get("HF_HOME")
-             if not hf_home:
-                 hf_home = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
-            
-             cache_path = os.path.join(hf_home, "hub", "models--jurabi--bert-ner-japanese")
-             if os.path.exists(cache_path):
-                 snapshots = os.path.join(cache_path, "snapshots")
-                 if os.path.exists(snapshots) and os.listdir(snapshots):
-                     use_system = True
-        except Exception:
-             pass
-
-        if use_system:
-             self._model_dir = None # Use default system cache
+        if resolve_ner_system_snapshot():
+            self._model_dir = None
         else:
-             # 2. Portable Fallback
-             if model_dir is None:
+            if model_dir is None:
                 app_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
                 model_dir = os.path.join(app_root, "models", "ner")
-             
-             # Check if model_dir contains the model files directly, or if it's a nested cache structure
-             if not os.path.exists(os.path.join(model_dir, "config.json")):
-                 # Look for nested cache structure: models--jurabi--bert-ner-japanese
-                 potential_cache = os.path.join(model_dir, "models--jurabi--bert-ner-japanese")
-                 if os.path.exists(potential_cache):
-                     # Look for snapshots
-                     snapshots = os.path.join(potential_cache, "snapshots")
-                     if os.path.exists(snapshots):
-                         # Get latest snapshot (or any)
-                         subs = [os.path.join(snapshots, d) for d in os.listdir(snapshots) if os.path.isdir(os.path.join(snapshots, d))]
-                         if subs:
-                             # Use the first valid snapshot found
-                             # (Ideally sort by mtime or something, but any valid one works)
-                             model_dir = subs[0]
-
-             # Only use portable directory if it actually exists/has content, otherwise we might fail later but that's expected
-             self._model_dir = model_dir
+            self._model_dir = resolve_ner_local_dir(model_dir) or model_dir
         self._force_cpu = force_cpu
         
         # Try to initialize
