@@ -24,7 +24,6 @@ logs/
 
 # executables
 *.exe
-*.spec
 
 # Local test data (not for repo)
 Test Manga/
@@ -34,3 +33,10 @@ models/
 dist/
 !app/models/
 !app/models/*.py
+
+# Local test code
+tests/
+
+# Documentation
+*.md
+!README.md

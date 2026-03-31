@@ -82,6 +82,7 @@ class PipelineSettings:
     prescan_enabled: bool = False  # Run pre-scan to build glossary before translation
     prescan_use_ner: bool = False  # Optional heavy NER enhancement for pre-scan
     debug_ocr: bool = False  # Save OCR crop images for debugging
+    prescan_only: bool = False  # Build glossary only, then stop without page translation
 
 
 class PipelineWorker(QtCore.QThread):
@@ -137,7 +138,7 @@ class PipelineWorker(QtCore.QThread):
 
         start_time = time.time()
         from app.detect.paddle_detector import PaddleTextDetector
-        from app.ocr.manga_ocr_engine import MangaOcrEngine
+        from app.ocr.manga_ocr_engine import MangaOcrEngine, ensure_torch_runtime_ready
         from app.translate.ollama_client import OllamaClient
         from app.render.renderer import render_translations
 
@@ -147,8 +148,15 @@ class PipelineWorker(QtCore.QThread):
         pages = []
         try:
             if self._settings.ocr_engine == "MangaOCR":
-                worker_error = None
                 try:
+                    ensure_torch_runtime_ready()
+                except Exception:
+                    pass
+                worker_error = None
+                force_worker = os.getenv("MT_FORCE_MANGA_OCR_WORKER") == "1"
+                try:
+                    if force_worker:
+                        raise RuntimeError("Forced MangaOCR worker mode.")
                     ocr_engine = MangaOcrEngine(self._settings.use_gpu)
                 except Exception as exc:
                     if _is_torch_missing(exc):
@@ -157,7 +165,10 @@ class PipelineWorker(QtCore.QThread):
                     else:
                         try:
                             from app.ocr.manga_ocr_worker import MangaOcrWorker
-                            self.message.emit("MangaOCR in-process failed; using worker process.")
+                            if force_worker:
+                                self.message.emit("MangaOCR worker mode forced for this run.")
+                            else:
+                                self.message.emit("MangaOCR in-process failed; using worker process.")
                             ocr_engine = MangaOcrWorker(use_gpu=self._settings.use_gpu)
                         except Exception as inner_exc:
                             worker_error = inner_exc
@@ -320,6 +331,9 @@ class PipelineWorker(QtCore.QThread):
                     logging.getLogger(__name__).exception("Pre-scan error")
                 finally:
                     self.prescan_finished.emit()
+            if self._settings.prescan_only:
+                self.message.emit("Pre-Scan only mode complete.")
+                return
             for index, name in enumerate(images, start=1):
                 if self._stop_requested:
                     self.message.emit("Stopped")
@@ -1281,6 +1295,18 @@ def _process_page(
             pass
         else:
             pending_texts.setdefault(ocr_text, []).append(region["region_id"])
+
+    if _looks_like_decorative_cover_page(regions, page_image):
+        for region in regions:
+            region["translation"] = ""
+            flags = dict(region.get("flags", {}))
+            flags["ignore"] = True
+            flags["bg_text"] = True
+            flags["needs_review"] = True
+            region["flags"] = flags
+        pending_texts.clear()
+        glossary_texts.clear()
+
     active_style_guide = style_guide
     
     # Skip runtime discovery if Pre-Scan is enabled (glossary is already built)
@@ -1351,17 +1377,31 @@ def _process_page(
                     enforced = _enforce_glossary(translation, text, active_style_guide)
                     text_to_translation[text] = enforced
         if not text_to_translation:
+            use_strict_single_fallback = bool(
+                settings
+                and settings.translator_backend == "GGUF"
+                and target_lang == "Simplified Chinese"
+            )
             for text in pending_texts.keys():
-                raw_trans = _translate_single(
-                    ollama,
-                    model,
-                    source_lang,
-                    target_lang,
-                    prompt_style_guide,
-                    text,
-                    context_lines=context_lines,
-                    settings=settings,
-                )
+                if use_strict_single_fallback:
+                    raw_trans = _translate_strict(
+                        ollama,
+                        model,
+                        source_lang,
+                        target_lang,
+                        _normalize_retry_source(text) or text,
+                    )
+                else:
+                    raw_trans = _translate_single(
+                        ollama,
+                        model,
+                        source_lang,
+                        target_lang,
+                        prompt_style_guide,
+                        text,
+                        context_lines=context_lines,
+                        settings=settings,
+                    )
                 # Apply glossary enforcement
                 text_to_translation[text] = _enforce_glossary(raw_trans, text, active_style_guide)
         for text, region_ids in pending_texts.items():
@@ -1380,6 +1420,17 @@ def _process_page(
                 text_to_translation.get(text, ""),
                 is_bubble=is_bubble,
             )
+            if translation:
+                translation = _enforce_glossary(translation, text, active_style_guide)
+                translation = _repair_translation_with_glossary(
+                    ollama,
+                    model,
+                    source_lang,
+                    target_lang,
+                    text,
+                    translation,
+                    active_style_guide,
+                )
             if translation:
                 translation_cache[text] = translation
             for region in regions:
@@ -1865,12 +1916,36 @@ def _clean_translation(text: str) -> str:
         "进行翻译",
         "将下面的日语翻译成",
         "翻译成简体中文",
+        "翻译成中文",
+        "翻譯成中文",
+        "翻译成中文是",
+        "翻譯成中文是",
         "只输出简体中文",
         "不要片假名",
         "不要平假名",
         "罗马音或英文",
         "日语原文",
         "请将日语",
+        "翻译成中文。",
+        "翻譯成中文。",
+        "输出时只保留",
+        "输出只包含",
+        "修改后的简体中文",
+        "修改后的繁體中文",
+        "修改后",
+        "修改後",
+        "必须原样保留这些占位符",
+        "必須原樣保留這些佔位符",
+        "原样保留这些占位符",
+        "原樣保留這些佔位符",
+        "不要翻译、不要删除、不要新增",
+        "不要翻譯、不要刪除、不要新增",
+        "不要删除、不要新增",
+        "不要刪除、不要新增",
+        "占位符",
+        "佔位符",
+        "标记：",
+        "標記：",
     ]
     for line in lines:
         head = line.strip()
@@ -1899,9 +1974,22 @@ def _clean_translation(text: str) -> str:
             or "只能使用" in head
             or "进行翻译" in head
             or "翻译成简体中文" in head
+            or "翻译成中文" in head
+            or "翻譯成中文" in head
+            or "修改后的简体中文" in head
+            or "修改后的繁體中文" in head
+            or "输出时只保留" in head
+            or "输出只包含" in head
             or "将下面的日语翻译成" in head
             or "请将日语" in head
             or "日语原文" in head
+            or "占位符" in head
+            or "佔位符" in head
+            or "原样保留这些" in head
+            or "原樣保留這些" in head
+            or "不要删除" in head
+            or "不要刪除" in head
+            or "不要新增" in head
         ):
             continue
         head = head.replace("文本：", "").replace("文本:", "")
@@ -1912,13 +2000,26 @@ def _clean_translation(text: str) -> str:
         if not head.strip():
             continue
         filtered.append(head)
-    cleaned = "\n".join(filtered).strip()
+    if len(filtered) >= 2 and all(_cjk_ratio(line) >= 0.45 for line in filtered):
+        first = filtered[0].strip()
+        rest = "".join(line.strip() for line in filtered[1:] if line.strip())
+        if first and rest:
+            first_body = re.sub(r"[，。！？：；、…\s]", "", first)
+            if len(first_body) <= 6 and first[-1] not in "，。！？：；、…,.!?;:":
+                cleaned = f"{first}，{rest}"
+            else:
+                cleaned = f"{first}{rest}"
+        else:
+            cleaned = "".join(filtered).strip()
+    else:
+        cleaned = "\n".join(filtered).strip()
     if cleaned.startswith("\"") and cleaned.endswith("\""):
         cleaned = cleaned[1:-1].strip()
     if cleaned.startswith("`") and cleaned.endswith("`"):
         cleaned = cleaned[1:-1].strip()
     if "Return only the translation" in cleaned:
         cleaned = cleaned.split("Return only the translation", 1)[0].strip()
+    cleaned = re.sub(r"[\"'“”]*(?:翻译成中文是[:：]?|翻譯成中文是[:：]?|翻译成中文[:：]?|翻譯成中文[:：]?).*$", "", cleaned).strip()
     cleaned = cleaned.strip("<> ")
     return cleaned
 
@@ -1983,6 +2084,309 @@ def _sanitize_glossary_target(target: str, source: str, target_lang: str) -> str
     return cleaned
 
 
+def _estimate_single_num_predict(text: str, target_lang: str = "") -> int:
+    text = str(text or "").strip()
+    if not text:
+        return 24
+    base = len(text)
+    if target_lang in {"Simplified Chinese", "Traditional Chinese"}:
+        return max(16, min(72, base * 2 + 12))
+    return max(24, min(96, base * 3 + 16))
+
+
+def _max_char_run(text: str) -> int:
+    text = str(text or "")
+    if not text:
+        return 0
+    best = 1
+    current = 1
+    prev = text[0]
+    for ch in text[1:]:
+        if ch == prev:
+            current += 1
+            if current > best:
+                best = current
+        else:
+            prev = ch
+            current = 1
+    return best
+
+
+def _non_punct_chars(text: str) -> list[str]:
+    chars = []
+    punct = set("。．，、！？：；….,!?:;·—～\"'`()[]{}<>-")
+    for ch in str(text or ""):
+        if ch.isspace() or ch in punct:
+            continue
+        chars.append(ch)
+    return chars
+
+
+def _leading_char_run(text: str) -> int:
+    text = str(text or "")
+    if not text:
+        return 0
+    first = text[0]
+    run = 1
+    for ch in text[1:]:
+        if ch != first:
+            break
+        run += 1
+    return run
+
+
+def _source_has_stutter_prefix(text: str) -> bool:
+    text = str(text or "").strip()
+    if not text:
+        return False
+    normalized = _normalize_retry_source(text)
+    if normalized and normalized != text:
+        return True
+    return bool(re.match(r"^[ぁ-んァ-ンー]{2,}[一-龯々ァ-ヶぁ-ゖA-Za-z0-9！？!?…]", text))
+
+
+def _looks_like_short_repeat_loop(translation: str, source_text: str = "") -> bool:
+    body = "".join(_non_punct_chars(translation))
+    if len(body) < 3 or len(body) > 10:
+        return False
+    longest = _max_char_run(body)
+    if longest >= 4:
+        return True
+    lead = _leading_char_run(body)
+    if lead >= 3:
+        return True
+    if _source_has_stutter_prefix(source_text) and longest >= 3:
+        return True
+    counts = {}
+    for ch in body:
+        counts[ch] = counts.get(ch, 0) + 1
+    dominant = max(counts.values(), default=0)
+    return dominant >= max(3, (len(body) * 2 + 2) // 3)
+
+
+def _looks_like_repetition_loop(translation: str, source_text: str = "") -> bool:
+    translation = str(translation or "").strip()
+    if not translation:
+        return False
+    body = _non_punct_chars(translation)
+    if _looks_like_short_repeat_loop(translation, source_text):
+        return True
+    joined = "".join(body)
+    if _leading_char_run(joined) >= 4 and len(joined) <= 16:
+        return True
+    if len(body) < 12:
+        return False
+    unique = len(set(body))
+    longest = _max_char_run(joined)
+    if longest >= 10:
+        return True
+    if unique <= 3 and len(body) >= max(18, len(str(source_text or "").strip()) * 2):
+        return True
+    if longest >= 6 and unique <= 2 and len(body) >= 16:
+        return True
+    return False
+
+
+def _normalize_retry_source(text: str) -> str:
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"^([ぁ-んァ-ンー])\1+", r"\1", text)
+    text = re.sub(r"([ぁ-んァ-ンー])\1{1,}", r"\1", text)
+    text = re.sub(r"([ぁ-んァ-ンー])\1(?=[ぁ-んァ-ンー]*[。！？!?…])", r"\1", text)
+    return text
+
+
+def _translation_has_bad_shape(translation: str, source_text: str = "") -> bool:
+    return _looks_like_prompt_leak(translation) or _looks_like_repetition_loop(translation, source_text)
+
+
+def _strip_name_suffixes(text: str) -> str:
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    suffixes = ("ちゃん", "さん", "くん", "様", "さま", "君", "氏", "っち", "ッチ")
+    changed = True
+    while changed and text:
+        changed = False
+        for suffix in suffixes:
+            if text.endswith(suffix) and len(text) > len(suffix):
+                text = text[: -len(suffix)]
+                changed = True
+                break
+    return text
+
+
+def _romanize_kana_name(text: str) -> str:
+    text = _strip_name_suffixes(text)
+    if not text:
+        return ""
+    chars = []
+    for ch in text:
+        code = ord(ch)
+        if 0x30A1 <= code <= 0x30F6:
+            chars.append(chr(code - 0x60))
+        else:
+            chars.append(ch)
+    hira = "".join(chars)
+    digraphs = {
+        "きゃ": "kya", "きゅ": "kyu", "きょ": "kyo",
+        "しゃ": "sha", "しゅ": "shu", "しょ": "sho",
+        "ちゃ": "cha", "ちゅ": "chu", "ちょ": "cho",
+        "にゃ": "nya", "にゅ": "nyu", "にょ": "nyo",
+        "ひゃ": "hya", "ひゅ": "hyu", "ひょ": "hyo",
+        "みゃ": "mya", "みゅ": "myu", "みょ": "myo",
+        "りゃ": "rya", "りゅ": "ryu", "りょ": "ryo",
+        "ぎゃ": "gya", "ぎゅ": "gyu", "ぎょ": "gyo",
+        "じゃ": "ja", "じゅ": "ju", "じょ": "jo",
+        "びゃ": "bya", "びゅ": "byu", "びょ": "byo",
+        "ぴゃ": "pya", "ぴゅ": "pyu", "ぴょ": "pyo",
+    }
+    singles = {
+        "あ": "a", "い": "i", "う": "u", "え": "e", "お": "o",
+        "か": "ka", "き": "ki", "く": "ku", "け": "ke", "こ": "ko",
+        "さ": "sa", "し": "shi", "す": "su", "せ": "se", "そ": "so",
+        "た": "ta", "ち": "chi", "つ": "tsu", "て": "te", "と": "to",
+        "な": "na", "に": "ni", "ぬ": "nu", "ね": "ne", "の": "no",
+        "は": "ha", "ひ": "hi", "ふ": "fu", "へ": "he", "ほ": "ho",
+        "ま": "ma", "み": "mi", "む": "mu", "め": "me", "も": "mo",
+        "や": "ya", "ゆ": "yu", "よ": "yo",
+        "ら": "ra", "り": "ri", "る": "ru", "れ": "re", "ろ": "ro",
+        "わ": "wa", "を": "o", "ん": "n",
+        "が": "ga", "ぎ": "gi", "ぐ": "gu", "げ": "ge", "ご": "go",
+        "ざ": "za", "じ": "ji", "ず": "zu", "ぜ": "ze", "ぞ": "zo",
+        "だ": "da", "ぢ": "ji", "づ": "zu", "で": "de", "ど": "do",
+        "ば": "ba", "び": "bi", "ぶ": "bu", "べ": "be", "ぼ": "bo",
+        "ぱ": "pa", "ぴ": "pi", "ぷ": "pu", "ぺ": "pe", "ぽ": "po",
+        "ぁ": "a", "ぃ": "i", "ぅ": "u", "ぇ": "e", "ぉ": "o",
+        "ゃ": "ya", "ゅ": "yu", "ょ": "yo",
+        "ゔ": "vu", "ー": "-", "っ": "",
+    }
+    result = []
+    i = 0
+    geminate = False
+    while i < len(hira):
+        ch = hira[i]
+        if ch == "っ":
+            geminate = True
+            i += 1
+            continue
+        pair = hira[i : i + 2]
+        romaji = digraphs.get(pair)
+        if romaji:
+            i += 2
+        else:
+            romaji = singles.get(ch, ch if ch.isascii() else "")
+            i += 1
+        if not romaji:
+            continue
+        if romaji == "-" and result:
+            result[-1] = result[-1] + result[-1][-1:]
+            continue
+        if geminate and romaji[0].isalpha():
+            romaji = romaji[0] + romaji
+            geminate = False
+        result.append(romaji)
+    return "".join(result).lower()
+
+
+def _replace_romanized_glossary_names(translation: str, item: dict) -> str:
+    if not translation or not isinstance(item, dict):
+        return translation
+    target = str(item.get("target", "")).strip()
+    source = str(item.get("source", "")).strip()
+    reading = str(item.get("reading", "")).strip()
+    if not target:
+        return translation
+    variants = set()
+    for seed in (reading, source):
+        romaji = _romanize_kana_name(seed)
+        if romaji and len(romaji) >= 3:
+            variants.add(romaji)
+            base = re.sub(r"(chan|san|kun|sama|shi|cchi)$", "", romaji)
+            if len(base) >= 3:
+                variants.add(base)
+    if not variants:
+        return translation
+    names = "|".join(re.escape(v) for v in sorted(variants, key=len, reverse=True))
+    pattern = re.compile(
+        rf"(?i)\b(?:{names})(?:[-· ]?(?:chan|san|kun|sama|shi|cchi))?(?:酱|醬|桑)?\b"
+    )
+    return pattern.sub(target, translation)
+
+
+def _matched_glossary_terms(source_text: str, style_guide: dict) -> list[dict]:
+    if not source_text or not isinstance(style_guide, dict):
+        return []
+    glossary = style_guide.get("glossary", []) or []
+    matched: list[dict] = []
+    for item in glossary:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source", "")).strip()
+        target = str(item.get("target", "")).strip()
+        if not source or not target or source not in source_text:
+            continue
+        matched.append(item)
+    matched.sort(
+        key=lambda entry: (
+            1 if str(entry.get("priority", "")).strip().lower() == "hard" else 0,
+            len(str(entry.get("source", ""))),
+        ),
+        reverse=True,
+    )
+    selected: list[dict] = []
+    for item in matched:
+        source = str(item.get("source", "")).strip()
+        if any(source in str(existing.get("source", "")).strip() for existing in selected):
+            continue
+        selected.append(item)
+    return selected
+
+
+def _glossary_target_counts(source_text: str, translation: str, style_guide: dict) -> tuple[dict[str, int], dict[str, int]]:
+    expected: dict[str, int] = {}
+    actual: dict[str, int] = {}
+    for item in _matched_glossary_terms(source_text, style_guide):
+        source = str(item.get("source", "")).strip()
+        target = str(item.get("target", "")).strip()
+        if not source or not target:
+            continue
+        expected[target] = expected.get(target, 0) + source_text.count(source)
+    for target in expected:
+        actual[target] = translation.count(target)
+    return expected, actual
+
+
+def _collapse_target_overuse(translation: str, target: str, expected_count: int) -> str:
+    if not translation or not target or expected_count < 0:
+        return translation
+    if expected_count <= 1:
+        translation = re.sub(rf"(?:{re.escape(target)}){{2,}}", target, translation)
+    actual_count = translation.count(target)
+    if actual_count <= expected_count:
+        return translation
+    pieces = translation.split(target)
+    rebuilt = []
+    used = 0
+    for idx, piece in enumerate(pieces[:-1]):
+        rebuilt.append(piece)
+        if used < expected_count:
+            rebuilt.append(target)
+            used += 1
+    rebuilt.append(pieces[-1])
+    return "".join(rebuilt)
+
+
+def _has_glossary_count_mismatch(source_text: str, translation: str, style_guide: dict) -> bool:
+    expected, actual = _glossary_target_counts(source_text, translation, style_guide)
+    if not expected:
+        return False
+    for target, expected_count in expected.items():
+        if actual.get(target, 0) != expected_count:
+            return True
+    return False
+
 
 def _enforce_glossary(
     translation: str,
@@ -2006,37 +2410,43 @@ def _enforce_glossary(
     if not translation or not source_text:
         return translation
     
-    glossary = style_guide.get("glossary", [])
-    if not glossary:
-        return translation
-    
-    # Build a mapping of source -> target for terms found in source text
-    terms_to_enforce = []
-    
-    for item in glossary:
-        if not isinstance(item, dict):
-            continue
-        source = str(item.get("source", "")).strip()
-        target = str(item.get("target", "")).strip()
-        
-        if not source or not target:
-            continue
-        
-        # Check if this glossary term appears in the source text
-        if source in source_text:
-            terms_to_enforce.append((source, target))
-    
+    terms_to_enforce = _matched_glossary_terms(source_text, style_guide)
     if not terms_to_enforce:
         return translation
     
     # For each term that should be in the translation, check and fix
     result = translation
     
-    for _, correct_target in terms_to_enforce:
+    for item in terms_to_enforce:
+        source = str(item.get("source", "")).strip()
+        correct_target = str(item.get("target", "")).strip()
+        if not source or not correct_target:
+            continue
         # Skip if target is already present
         if correct_target in result:
             continue
-        
+
+        updated = _replace_romanized_glossary_names(result, item)
+        if updated != result:
+            result = updated
+            if correct_target in result:
+                continue
+
+        if source_text.startswith(source):
+            remainder = source_text[len(source):].lstrip()
+            if remainder.startswith(("!", "！")):
+                lead = f"{correct_target}！"
+            elif remainder.startswith(("?", "？")):
+                lead = f"{correct_target}？"
+            elif remainder.startswith(("。", "、", ",", "，")):
+                lead = f"{correct_target}，"
+            else:
+                lead = f"{correct_target}，"
+            body = result.lstrip("，。！？!?,、 ")
+            body = re.sub(r"^[\u4e00-\u9fff]{1,4}(?:[！!？?，,、]\s*)", "", body)
+            result = lead if not body else f"{lead}{body}"
+            continue
+
         # Calculate expected length of the name translation (in characters)
         target_len = len(correct_target)
         
@@ -2079,6 +2489,144 @@ def _enforce_glossary(
                 pass 
                 
     return result
+
+
+def _repair_translation_with_glossary(
+    ollama,
+    model: str,
+    source_lang: str,
+    target_lang: str,
+    source_text: str,
+    translation: str,
+    style_guide: dict,
+) -> str:
+    matched_terms = _matched_glossary_terms(source_text, style_guide)
+    if not matched_terms:
+        return translation
+    masked_primary = _translate_with_glossary_placeholders(
+        ollama,
+        model,
+        source_lang,
+        target_lang,
+        source_text,
+        matched_terms,
+    )
+    if masked_primary:
+        expected, actual = _glossary_target_counts(source_text, masked_primary, style_guide)
+        if expected and all(actual.get(target, 0) == expected_count for target, expected_count in expected.items()):
+            return masked_primary
+    required_terms = []
+    for item in matched_terms:
+        source = str(item.get("source", "")).strip()
+        target = str(item.get("target", "")).strip()
+        if not source or not target:
+            continue
+        expected_count = max(1, source_text.count(source))
+        actual_count = translation.count(target)
+        if actual_count != expected_count:
+            required_terms.append((source, target, expected_count))
+    if not required_terms and not _has_glossary_count_mismatch(source_text, translation, style_guide):
+        return translation
+    mapping_lines = "\n".join(
+        f"- {source} -> {target} (必须出现 {expected_count} 次)"
+        for source, target, expected_count in required_terms
+    )
+    prompt = (
+        f"请将下面的日语翻译成{target_lang}，并严格使用指定名字。\n"
+        f"必须使用这些对应：\n{mapping_lines}\n"
+        "如果原文出现这些名字，只能使用上面的对应写法，不要使用音译、罗马字或其他变体。\n"
+        "不要增加新的名字，不要重复已经正确的名字，名字出现次数要和原文一致。\n"
+        "不要解释，不要保留错误名字，只输出简体中文译文。\n"
+        f"日语原文：{source_text}"
+    )
+    try:
+        revised = _clean_translation(
+            ollama.generate(
+                _resolve_model(model),
+                prompt,
+                timeout=30,
+                options={
+                    "num_predict": _estimate_single_num_predict(source_text + translation, target_lang),
+                    "temperature": 0.05,
+                    "top_p": 0.9,
+                },
+            )
+        )
+    except Exception:
+        return translation
+    if not revised:
+        return translation
+    revised = _enforce_glossary(revised, source_text, style_guide)
+    for _, target, expected_count in required_terms:
+        revised = _collapse_target_overuse(revised, target, expected_count)
+    expected, actual = _glossary_target_counts(source_text, revised, style_guide)
+    if any(actual.get(target, 0) != expected_count for target, expected_count in expected.items()):
+        masked = _translate_with_glossary_placeholders(
+            ollama,
+            model,
+            source_lang,
+            target_lang,
+            source_text,
+            matched_terms,
+        )
+        if masked:
+            return masked
+        return translation
+    return revised
+
+
+def _translate_with_glossary_placeholders(
+    ollama,
+    model: str,
+    source_lang: str,
+    target_lang: str,
+    source_text: str,
+    matched_terms: list[dict],
+) -> str:
+    placeholders: list[tuple[str, str]] = []
+    masked_source = source_text
+    for idx, item in enumerate(matched_terms):
+        source = str(item.get("source", "")).strip()
+        target = str(item.get("target", "")).strip()
+        if not source or not target or source not in masked_source:
+            continue
+        token = f"[N{idx}]"
+        masked_source = masked_source.replace(source, token)
+        placeholders.append((token, target))
+    if not placeholders:
+        return ""
+    token_list = " ".join(token for token, _ in placeholders)
+    prompt = (
+        f"将下面的{source_lang}翻译成{target_lang}。\n"
+        f"这些标记必须原样保留：{token_list}\n"
+        "只输出译文。\n"
+        f"原文：{masked_source}"
+    )
+    try:
+        raw = ollama.generate(
+                _resolve_model(model),
+                prompt,
+                timeout=30,
+                options={
+                    "num_predict": _estimate_single_num_predict(source_text, target_lang),
+                    "temperature": 0.05,
+                    "top_p": 0.9,
+                },
+            )
+        translated = _clean_translation(raw)
+    except Exception:
+        return ""
+    if not translated:
+        return ""
+    if _looks_like_prompt_leak(raw) or _looks_like_prompt_leak(translated):
+        return ""
+    for token, target in placeholders:
+        if token not in translated:
+            return ""
+        translated = translated.replace(token, target)
+    if _looks_like_prompt_leak(translated):
+        return ""
+    return translated
 
 
 import threading
@@ -2933,6 +3481,10 @@ def _batch_translate(
              top_p = settings.ollama_top_p
              
     batch_size = 16
+    if settings and settings.translator_backend == "GGUF":
+        # Smaller GGUF batches are more stable for Sakura-style JSON output
+        # and avoid pathological long generations on dense pages.
+        batch_size = 6
     for start in range(0, len(items), batch_size):
         chunk = items[start : start + batch_size]
         prompt = build_batch_translation_prompt(
@@ -2943,6 +3495,8 @@ def _batch_translate(
             context_lines=context_lines,
         )
         token_limit = _estimate_num_predict(chunk)
+        if settings and settings.translator_backend == "GGUF":
+            token_limit = min(token_limit, 224 if target_lang == "Simplified Chinese" else 256)
         try:
             raw = ollama.generate(
                 resolved,
@@ -3004,24 +3558,27 @@ def _translate_single(
              temp = settings.ollama_temperature
              top_p = settings.ollama_top_p
 
+    token_limit = _estimate_single_num_predict(text, target_lang)
     result = ollama.generate(
         _resolve_model(model),
         prompt,
         timeout=300,
-    options={"num_predict": 160, "temperature": temp, "top_p": top_p},
+    options={"num_predict": token_limit, "temperature": temp, "top_p": top_p},
     )
     cleaned = _clean_translation(result)
-    if not cleaned and text.strip():
+    if (_translation_has_bad_shape(cleaned, text) or not cleaned) and text.strip():
         # Fallback: Force translation
+        retry_text = _normalize_retry_source(text) or text
         retry_prompt = (
             f"Translate to {target_lang}. Translate exactly, do not skip. Output only the translation.\n"
-            f"Text: {text}"
+            "Do not repeat a single character or syllable in a loop.\n"
+            f"Text: {retry_text}"
         )
         result = ollama.generate(
             _resolve_model(model),
             retry_prompt,
             timeout=300,
-            options={"num_predict": 160, "temperature": temp},
+            options={"num_predict": token_limit, "temperature": min(temp, 0.1), "top_p": top_p},
         )
         cleaned = _clean_translation(result)
     return cleaned
@@ -3036,18 +3593,21 @@ def _ensure_target_language(
     translation: str,
     is_bubble: bool = False,
 ) -> tuple[str, bool]:
+    retry_source = _normalize_retry_source(ocr_text) or ocr_text
     if _looks_like_merged_batch_output(translation, ocr_text):
-        translation = _translate_strict(ollama, model, source_lang, target_lang, ocr_text)
+        translation = _translate_strict(ollama, model, source_lang, target_lang, retry_source)
+    elif _looks_like_repetition_loop(translation, ocr_text):
+        translation = _translate_strict(ollama, model, source_lang, target_lang, retry_source)
     elif _too_long_translation(translation, ocr_text):
-        translation = _translate_brief(ollama, model, source_lang, target_lang, ocr_text)
+        translation = _translate_brief(ollama, model, source_lang, target_lang, retry_source)
     if _looks_like_prompt_leak(translation):
-        translation = _translate_strict(ollama, model, source_lang, target_lang, ocr_text)
+        translation = _translate_strict(ollama, model, source_lang, target_lang, retry_source)
     
     # Only silence SFX/Empty if it's NOT a speech bubble.
     if not translation and TextFilter(None).should_ignore(ocr_text, "background_text") and not is_bubble:
         return "", True
 
-    if _language_ok(target_lang, translation) and not _looks_like_prompt_leak(translation):
+    if _language_ok(target_lang, translation) and not _translation_has_bad_shape(translation, ocr_text):
         return translation, True
     
     # Build retry prompt - be explicit about language requirements
@@ -3055,47 +3615,50 @@ def _ensure_target_language(
         retry_prompt = (
             f"将下面的日语翻译成简体中文。\n"
             f"只输出简体中文译文，不要片假名、平假名、罗马音或英文。\n"
-            f"日语原文: {ocr_text}\n"
+            "不要把同一个字重复很多次。\n"
+            f"日语原文: {retry_source}\n"
         )
     else:
         retry_prompt = (
             f"Translate {source_lang} to {target_lang}.\n"
             "No English, no romaji, no explanations.\n"
-            f"Text: {ocr_text}\n"
+            "Do not repeat a single character or syllable in a loop.\n"
+            f"Text: {retry_source}\n"
         )
     retry = _clean_translation(
         ollama.generate(
             model,
             retry_prompt,
             timeout=30,
-            options={"num_predict": 128, "temperature": 0.1, "top_p": 0.9},
+            options={"num_predict": _estimate_single_num_predict(retry_source, target_lang), "temperature": 0.1, "top_p": 0.9},
         )
     )
-    if _looks_like_prompt_leak(retry):
-        retry = _translate_strict(ollama, model, source_lang, target_lang, ocr_text)
-    if _language_ok(target_lang, retry) and not _looks_like_prompt_leak(retry):
+    if _translation_has_bad_shape(retry, ocr_text):
+        retry = _translate_strict(ollama, model, source_lang, target_lang, retry_source)
+    if _language_ok(target_lang, retry) and not _translation_has_bad_shape(retry, ocr_text):
         return retry, True
     
     # Second retry for Chinese if still has Kana - be even more explicit
     if target_lang == "Simplified Chinese" and _kana_ratio(retry) > 0.05:
         final_prompt = (
-            f"请将日语'{ocr_text}'翻译成中文。\n"
+            f"请将日语'{retry_source}'翻译成中文。\n"
             f"重要：你的回答中绝对不能包含日语假名（ひらがな/カタカナ）。\n"
             f"只能使用纯中文汉字进行翻译。\n"
+            "不要把同一个字重复很多次。\n"
         )
         final = _clean_translation(
             ollama.generate(
                 model,
                 final_prompt,
                 timeout=30,
-                options={"num_predict": 128, "temperature": 0.05, "top_p": 0.9},
+                options={"num_predict": _estimate_single_num_predict(retry_source, target_lang), "temperature": 0.05, "top_p": 0.9},
             )
         )
-        if _language_ok(target_lang, final) and not _looks_like_prompt_leak(final):
+        if _language_ok(target_lang, final) and not _translation_has_bad_shape(final, ocr_text):
             return final, True
         retry = final if final else retry
     
-    if _looks_like_prompt_leak(retry or translation):
+    if _translation_has_bad_shape(retry or translation, ocr_text):
         return "", False
     return retry or translation, False
 
@@ -3133,7 +3696,7 @@ def _translate_brief(
     text: str,
 ) -> str:
     if target_lang == "Simplified Chinese":
-        prompt = f"将以下{source_lang}翻译成简体中文，保持简短：{text}"
+        prompt = f"将以下{source_lang}翻译成简体中文，保持简短，不要把同一个字重复很多次：{text}"
     elif target_lang == "English":
         prompt = f"Translate the following {source_lang} into English. Keep it short: {text}"
     else:
@@ -3142,7 +3705,7 @@ def _translate_brief(
         _resolve_model(model),
         prompt,
         timeout=30,
-        options={"num_predict": 128, "temperature": 0.1, "top_p": 0.9},
+        options={"num_predict": _estimate_single_num_predict(text, target_lang), "temperature": 0.1, "top_p": 0.9},
     )
     return _clean_translation(result)
 
@@ -3204,6 +3767,12 @@ def _looks_like_prompt_leak(text: str) -> bool:
         "没有英语",
         "没有罗马音",
         "没有解释",
+        "必须原样保留这些占位符",
+        "原样保留这些占位符",
+        "不要翻译、不要删除、不要新增",
+        "不要删除、不要新增",
+        "占位符",
+        "标记：",
     ]
     if any(m in lowered for m in markers):
         return True
@@ -3221,7 +3790,7 @@ def _translate_strict(
     text: str,
 ) -> str:
     if target_lang == "Simplified Chinese":
-        prompt = f"将以下{source_lang}翻译成简体中文：{text}"
+        prompt = f"将以下{source_lang}翻译成简体中文，不要把同一个字重复很多次：{text}"
     elif target_lang == "English":
         prompt = f"Translate the following {source_lang} into English: {text}"
     else:
@@ -3230,7 +3799,7 @@ def _translate_strict(
         _resolve_model(model),
         prompt,
         timeout=180,
-        options={"num_predict": 160, "temperature": 0.1, "top_p": 0.9},
+        options={"num_predict": _estimate_single_num_predict(text, target_lang), "temperature": 0.1, "top_p": 0.9},
     )
     return _clean_translation(result)
 
@@ -3309,6 +3878,12 @@ def _should_ignore_speech_fragment(
     area_ratio = (max(1, w) * max(1, h)) / page_area
     kana_only = all(_is_kana(ch) or ch in {"ー", "・"} for ch in cleaned)
     narrow_box = min(max(1, w), max(1, h)) <= 42
+    has_japanese = any(_is_kana(ch) or 0x4E00 <= ord(ch) <= 0x9FFF for ch in cleaned)
+    if not has_japanese:
+        if len(cleaned) <= 6 and area_ratio < 0.003:
+            return True
+        if narrow_box and re.fullmatch(r"[A-Za-z0-9+\-_.:/…]+", cleaned):
+            return True
     if len(cleaned) == 1:
         if kana_only and area_ratio < 0.0035 and ocr_conf < 0.985:
             return True
@@ -3385,6 +3960,54 @@ def _classify_semantic_region(
         return region_type, bg_text, True, True, render_updates
 
     return region_type, bg_text, False, needs_review, render_updates
+
+
+def _cover_page_saturation(image_obj) -> float:
+    if image_obj is None:
+        return 0.0
+    try:
+        hsv = image_obj.convert("HSV")
+        from PIL import ImageStat
+
+        stats = ImageStat.Stat(hsv)
+        if not stats.mean or len(stats.mean) < 2:
+            return 0.0
+        return float(stats.mean[1])
+    except Exception:
+        return 0.0
+
+
+def _looks_like_decorative_cover_page(regions: list[dict], image_obj) -> bool:
+    active = [r for r in regions if not r.get("ignore")]
+    if not active or len(active) > 8:
+        return False
+    if _cover_page_saturation(image_obj) < 28.0:
+        return False
+    texts = [str(r.get("ocr_text", "")).strip() for r in active]
+    if not texts:
+        return False
+    sentence_like = 0
+    mixed_or_latin = 0
+    shortish = 0
+    page_area = max(1, image_obj.size[0] * image_obj.size[1]) if image_obj is not None else 1
+    total_area_ratio = 0.0
+    for region, text in zip(active, texts):
+        body = _non_punct_chars(text)
+        if any(ch in text for ch in "。！？!?") or len(body) >= 10:
+            sentence_like += 1
+        if _has_latin_text(text) or _has_mixed_scripts(text):
+            mixed_or_latin += 1
+        if len(body) <= 6:
+            shortish += 1
+        x, y, w, h = region.get("bbox", [0, 0, 0, 0])
+        total_area_ratio += (max(1, int(w)) * max(1, int(h))) / page_area
+    if sentence_like > 0:
+        return False
+    if mixed_or_latin == 0:
+        return False
+    if shortish < max(3, len(active) - 1):
+        return False
+    return total_area_ratio <= 0.18
 
 
 def _box_luma_stats_pil(image_obj, bbox: list):
@@ -3913,6 +4536,51 @@ def _find_inconsistent_pages(pages: list, style_guide: dict) -> list[int]:
     return inconsistent_pages
 
 
+def _is_supported_name_char(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0x3040 <= code <= 0x30FF
+        or 0x4E00 <= code <= 0x9FFF
+        or ch in {"ー", "・", "々", "ヶ", "ケ", "ヴ"}
+    )
+
+
+def _looks_like_clean_name_surface(text: str) -> bool:
+    text = str(text or "").strip()
+    if not text or len(text) > 12:
+        return False
+    if not all(_is_supported_name_char(ch) for ch in text):
+        return False
+    if all(0x4E00 <= ord(ch) <= 0x9FFF for ch in text) and len(text) > 6:
+        return False
+    for honorific in ("さん", "くん", "ちゃん", "様", "先生", "先輩", "殿", "君", "氏"):
+        pos = text.find(honorific)
+        if pos >= 0 and pos + len(honorific) < len(text):
+            return False
+    return _is_cjk_term(text)
+
+
+def _looks_like_clean_cjk_target(text: str, target_lang: str) -> bool:
+    text = str(text or "").strip()
+    if not text:
+        return False
+    if target_lang not in {"Simplified Chinese", "Traditional Chinese"}:
+        return True
+    if len(text) > 12:
+        return False
+    allowed_punct = set("·・0123456789０１２３４５６７８９ ")
+    saw_han = False
+    for ch in text:
+        code = ord(ch)
+        if ch in allowed_punct:
+            continue
+        if 0x4E00 <= code <= 0x9FFF:
+            saw_han = True
+            continue
+        return False
+    return saw_han
+
+
 def _sanitize_style_guide(style_guide: dict, target_lang: str) -> dict:
     if not isinstance(style_guide, dict):
         return style_guide
@@ -3924,6 +4592,20 @@ def _sanitize_style_guide(style_guide: dict, target_lang: str) -> dict:
     raw_chars = style_guide.get("characters", []) or []
     for raw_char in raw_chars:
         norm = _normalize_character_entry(raw_char)
+        if not norm:
+            continue
+        original = str(norm.get("original", "")).strip()
+        reading = str(norm.get("reading", "")).strip()
+        translation = str(norm.get("translation", "")).strip()
+        if not original or not _looks_like_clean_name_surface(original):
+            changed = True
+            continue
+        if _is_cjk_term(original) and (not reading or not all(_is_kana(ch) for ch in reading)):
+            changed = True
+            continue
+        if translation and not _looks_like_clean_cjk_target(translation, target_lang):
+            changed = True
+            continue
         if norm and norm.get("original"):
             normalized_chars.append(norm)
     if raw_chars != normalized_chars:
@@ -3931,16 +4613,52 @@ def _sanitize_style_guide(style_guide: dict, target_lang: str) -> dict:
         style_guide["characters"] = normalized_chars
         changed = True
 
-    # Collect aliases for name validation.
-    alias_sources = set()
+    alias_target_map: dict[str, str] = {}
+    alias_owner_map: dict[str, str] = {}
+    for char in normalized_chars:
+        canonical = str(char.get("original", "")).strip()
+        for alias in char.get("aliases", []) or []:
+            if not isinstance(alias, dict):
+                continue
+            src = str(alias.get("source", "")).strip()
+            tgt = str(alias.get("target", "")).strip()
+            if not src or src == canonical:
+                continue
+            alias_owner_map.setdefault(src, canonical)
+            if tgt:
+                alias_target_map.setdefault(src, tgt)
+
+    deduped_chars = []
     for char in normalized_chars:
         original = str(char.get("original", "")).strip()
+        owner = alias_owner_map.get(original, "")
+        if owner and owner != original:
+            changed = True
+            continue
+        deduped_chars.append(char)
+    if deduped_chars != normalized_chars:
+        normalized_chars = deduped_chars
+        style_guide = dict(style_guide)
+        style_guide["characters"] = normalized_chars
+
+    alias_sources = set()
+    alias_target_map = {}
+    for char in normalized_chars:
+        original = str(char.get("original", "")).strip()
+        translation = str(char.get("translation", "")).strip()
         if original:
             alias_sources.add(original)
+        if original and translation and translation != original:
+            alias_target_map.setdefault(original, translation)
         for alias in char.get("aliases", []) or []:
             src = str(alias.get("source", "")).strip()
+            tgt = str(alias.get("target", "")).strip()
             if src:
                 alias_sources.add(src)
+            if src and tgt:
+                alias_target_map[src] = tgt
+
+    # Collect aliases for name validation.
     honorifics = ("さん", "くん", "ちゃん", "様", "先生", "先輩", "殿", "君", "氏")
     for item in glossary:
         if not isinstance(item, dict):
@@ -3948,10 +4666,17 @@ def _sanitize_style_guide(style_guide: dict, target_lang: str) -> dict:
         source = str(item.get("source", "")).strip()
         target = str(item.get("target", "")).strip()
         reading = str(item.get("reading", "")).strip()
+        preferred_target = alias_target_map.get(source, "")
         if item.get("auto"):
+            if not _looks_like_clean_name_surface(source):
+                changed = True
+                continue
             has_honorific = any(h in source for h in honorifics)
             reading_is_kana = bool(reading) and all(_is_kana(ch) for ch in reading)
             source_is_kana = bool(source) and all(_is_kana(ch) for ch in source)
+            if not source_is_kana and not has_honorific and not reading_is_kana and source not in alias_sources:
+                changed = True
+                continue
             if not (has_honorific or reading_is_kana or source_is_kana or source in alias_sources):
                 if _is_cjk_term(source) and (not reading or reading == source) and len(source) <= 3:
                     changed = True
@@ -3959,8 +4684,12 @@ def _sanitize_style_guide(style_guide: dict, target_lang: str) -> dict:
                 if not reading or reading == source:
                     changed = True
                     continue
-            cleaned_target = _sanitize_glossary_target(target, source, target_lang)
+            target_to_check = preferred_target or target
+            cleaned_target = _sanitize_glossary_target(target_to_check, source, target_lang)
             if not cleaned_target:
+                changed = True
+                continue
+            if not _looks_like_clean_cjk_target(cleaned_target, target_lang):
                 changed = True
                 continue
             if cleaned_target != target:

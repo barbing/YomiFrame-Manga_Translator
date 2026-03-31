@@ -46,6 +46,7 @@ def render_translations(
                 Tuple[int, int, int] | None,
                 float,
                 int,
+                str,
             ]
         ] = []
         background_boxes: List[Tuple[Tuple[int, int, int, int], Tuple[int, int, int] | None]] = []
@@ -186,6 +187,7 @@ def render_translations(
                     stroke_color,
                     line_height,
                     font_size_override,
+                    str(render.get("wrap_mode", "auto") or "auto"),
                 )
             )
 
@@ -227,10 +229,10 @@ def render_translations(
         median_height = 0
         preferred_size = None
         if render_regions:
-            heights = sorted(max(1, box[3] - box[1]) for _, box, _, _, _, _, _, _ in render_regions)
+            heights = sorted(max(1, box[3] - box[1]) for _, box, _, _, _, _, _, _, _ in render_regions)
             median_height = heights[len(heights) // 2]
             preferred_size = max(12, int(median_height * 0.33))
-        for text, box, region_font, forced_color, stroke_width, stroke_color, line_height_scale, font_size_override in render_regions:
+        for text, box, region_font, forced_color, stroke_width, stroke_color, line_height_scale, font_size_override, wrap_mode in render_regions:
             x0, y0, x1, y1 = box
             w = max(1, x1 - x0)
             h = max(1, y1 - y0)
@@ -248,6 +250,20 @@ def render_translations(
                     local_preferred = width_cap
                 else:
                     local_preferred = min(local_preferred, width_cap)
+            fill_color = forced_color or _resolve_text_color(working, box)
+            if _should_use_vertical_layout(text, w, h, wrap_mode):
+                _draw_vertical_text(
+                    draw,
+                    text,
+                    box,
+                    region_font,
+                    fill_color,
+                    stroke_width,
+                    stroke_color,
+                    line_height_scale=line_height_scale,
+                    preferred_size=local_preferred,
+                )
+                continue
             base_font = _fit_font(
                 draw,
                 text,
@@ -278,7 +294,6 @@ def render_translations(
                         best_height = test_height
                         break
             offset_y = y0 + max(0, (h - best_height) // 2)
-            fill_color = forced_color or _resolve_text_color(working, box)
             for line in best_lines:
                 bbox = best_font.getbbox(line)
                 line_width = bbox[2] - bbox[0]
@@ -942,6 +957,144 @@ def _wrap_text(draw, text: str, font, max_width: int, max_lines: int | None = No
     return lines
 
 
+def _should_use_vertical_layout(text: str, width: int, height: int, wrap_mode: str) -> bool:
+    mode = str(wrap_mode or "auto").strip().lower()
+    if mode == "vertical":
+        return True
+    if mode == "horizontal":
+        return False
+    if not _has_cjk(text) or " " in text:
+        return False
+    return height > width * 1.25
+
+
+def _vertical_tokens(text: str) -> List[str]:
+    tokens: List[str] = []
+    for ch in str(text or ""):
+        if ch in {"\r", "\n", "\t", " "}:
+            continue
+        tokens.append(ch)
+    return tokens
+
+
+def _vertical_punct_chars() -> set[str]:
+    return {"。", "．", "，", "、", "！", "？", "：", "；", "…", "·"}
+
+
+def _fit_vertical_font(
+    text: str,
+    box_width: int,
+    box_height: int,
+    font_name: str,
+    preferred_size: int | None = None,
+    line_height_scale: float = 1.0,
+):
+    font_path = _find_font_path(font_name)
+    sample = _sample_char(text)
+    tokens = _vertical_tokens(text) or ["字"]
+    start_size = min(72, max(10, int(min(box_width * 0.95, box_height * 0.20))))
+    min_size = max(8, int(min(box_height * 0.10, box_width * 0.45)))
+    if preferred_size is not None:
+        start_size = min(start_size, max(min_size, preferred_size))
+    for size in range(start_size, min_size - 1, -1):
+        font = _load_font(font_path, size, sample)
+        layout = _measure_vertical_layout(font, tokens, box_width, box_height, line_height_scale)
+        if layout is not None:
+            return font, layout
+    font = _load_font(font_path, min_size, sample)
+    layout = _measure_vertical_layout(font, tokens, box_width, box_height, line_height_scale)
+    if layout is None:
+        cell_height = max(1, int(_text_height(font, "国") * line_height_scale))
+        col_width = max(1, int(max(_text_width(font, tok) for tok in tokens)))
+        rows = max(1, box_height // max(1, cell_height))
+        cols = max(1, min(len(tokens), box_width // max(1, col_width)))
+        layout = (rows, cols, cell_height, col_width)
+    return font, layout
+
+
+def _measure_vertical_layout(font, tokens: List[str], box_width: int, box_height: int, line_height_scale: float):
+    if not tokens:
+        return None
+    cell_height = max(1, int(_text_height(font, "国") * line_height_scale))
+    col_width = max(1, int(max(_text_width(font, tok) for tok in tokens)))
+    rows = max(1, box_height // max(1, cell_height))
+    if rows <= 0:
+        return None
+    cols_needed = (len(tokens) + rows - 1) // rows
+    if cols_needed <= 0:
+        cols_needed = 1
+    if cols_needed * col_width > box_width:
+        return None
+    return rows, cols_needed, cell_height, col_width
+
+
+def _text_width(font, text: str) -> int:
+    bbox = font.getbbox(text)
+    return max(1, int(bbox[2] - bbox[0]))
+
+
+def _draw_vertical_text(
+    draw,
+    text: str,
+    box: Tuple[int, int, int, int],
+    font_name: str,
+    fill_color,
+    stroke_width: int,
+    stroke_color,
+    line_height_scale: float = 1.0,
+    preferred_size: int | None = None,
+) -> None:
+    x0, y0, x1, y1 = box
+    width = max(1, x1 - x0)
+    height = max(1, y1 - y0)
+    tokens = _vertical_tokens(text)
+    if not tokens:
+        return
+    base_font, layout = _fit_vertical_font(
+        text,
+        width,
+        height,
+        font_name,
+        preferred_size=preferred_size,
+        line_height_scale=line_height_scale,
+    )
+    rows, cols, cell_height, col_width = layout
+    total_width = cols * col_width
+    start_x = x0 + max(0, (width - total_width) // 2)
+    punctuation = _vertical_punct_chars()
+    font_path = _find_font_path(font_name)
+    punct_cache = {}
+    for col in range(cols):
+        col_tokens = tokens[col * rows : (col + 1) * rows]
+        col_x = start_x + (cols - 1 - col) * col_width
+        offset_y = y0 + max(0, (height - len(col_tokens) * cell_height) // 2)
+        for row, token in enumerate(col_tokens):
+            font = base_font
+            local_stroke = stroke_width
+            if token in punctuation:
+                punct_size = max(8, int(getattr(base_font, "size", 12) * 0.78))
+                if punct_size not in punct_cache:
+                    punct_cache[punct_size] = _load_font(font_path, punct_size, token)
+                font = punct_cache[punct_size]
+                local_stroke = min(local_stroke, 1)
+            bbox = font.getbbox(token)
+            char_w = bbox[2] - bbox[0]
+            char_h = bbox[3] - bbox[1]
+            draw_x = col_x + max(0, (col_width - char_w) // 2) - bbox[0]
+            draw_y = offset_y + row * cell_height + max(0, (cell_height - char_h) // 2) - bbox[1]
+            if token in {"，", "、", "。", "．", "：", "；"}:
+                draw_x += max(0, int(col_width * 0.12))
+                draw_y -= max(0, int(cell_height * 0.06))
+            draw.text(
+                (draw_x, draw_y),
+                token,
+                fill=fill_color,
+                font=font,
+                stroke_width=local_stroke,
+                stroke_fill=stroke_color,
+            )
+
+
 def _join_tokens(tokens: List[str], has_space: bool) -> str:
     if not tokens:
         return ""
@@ -960,7 +1113,24 @@ def _normalize_text(text: str) -> str:
     if not text:
         return ""
     cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
-    cleaned = " ".join(part for part in cleaned.split("\n") if part.strip())
+    parts = [part.strip() for part in cleaned.split("\n") if part.strip()]
+    if not parts:
+        return ""
+    if _has_cjk("".join(parts)):
+        if len(parts) >= 2:
+            first = parts[0]
+            rest = "".join(parts[1:])
+            first_body = re.sub(r"[，。！？：；、…\s]", "", first)
+            if first and rest and len(first_body) <= 6 and first[-1] not in "，。！？：；、…,.!?;:":
+                cleaned = f"{first}，{rest}"
+            elif any(" " in part for part in parts):
+                cleaned = " ".join(parts)
+            else:
+                cleaned = "".join(parts)
+        else:
+            cleaned = parts[0]
+    else:
+        cleaned = " ".join(parts)
     if _has_cjk(cleaned):
         cleaned = re.sub(r"[.．]{2,}", "…", cleaned)
         cleaned = re.sub(r"…{2,}", "…", cleaned)

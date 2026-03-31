@@ -43,11 +43,12 @@ def _first_dir_with_files(dirs: Iterable[str], required_files: Iterable[str]) ->
 
 
 def resolve_manga_ocr_system_ref() -> Optional[str]:
-    if _first_dir_with_files(
+    snapshot = _first_dir_with_files(
         _hf_snapshot_dirs("kha-white", "manga-ocr-base"),
         MANGA_OCR_FILES,
-    ):
-        return "kha-white/manga-ocr-base"
+    )
+    if snapshot:
+        return snapshot
     return None
 
 

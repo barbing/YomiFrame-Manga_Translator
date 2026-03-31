@@ -425,6 +425,8 @@ def prescan_for_glossary(
         translated_name = str(char.get("translation") or "").strip()
         reading = str(char.get("reading", "")).strip()
         aliases_raw = sorted(set(char.get("aliases", []) or []))
+        if not _looks_like_exportable_canonical(canonical, reading, translated_name):
+            continue
         if not translated_name and canonical not in preserved_canonicals:
             continue
         if not translated_name and _is_all_kana_candidate(canonical):
@@ -435,6 +437,8 @@ def prescan_for_glossary(
             alias_source = str(alias).strip()
             if not alias_source or alias_source == canonical:
                 continue
+            if not _looks_like_clean_name_surface(alias_source):
+                continue
             alias_obj = _build_alias_object(
                 alias_source,
                 canonical,
@@ -444,7 +448,7 @@ def prescan_for_glossary(
                 translator=translator,
                 settings=settings,
             )
-            if alias_obj.get("target"):
+            if alias_obj.get("target") and _looks_like_clean_name_surface(str(alias_obj.get("source", "")).strip()):
                 alias_objs.append(alias_obj)
                 generated_glossary.append(_alias_obj_to_glossary_entry(alias_obj))
         normalized_chars.append(
@@ -490,6 +494,11 @@ def prescan_for_glossary(
             glossary_map[source] = entry
         
     style_guide["glossary"] = list(glossary_map.values())
+    try:
+        from app.pipeline.controller import _sanitize_style_guide
+        style_guide = _sanitize_style_guide(style_guide, settings.target_lang)
+    except Exception as e:
+        logger.warning(f"Pre-scan: final style-guide sanitization failed: {e}")
     
     # === CRITICAL: Free all GPU resources before main translation ===
     # Prescan creates its own detector/OCR/NER instances.
@@ -741,6 +750,56 @@ def _has_non_kana_alias(aliases: list[str] | set[str], canonical: str = "") -> b
         if alias and alias != canonical and not _is_loose_kana_candidate(alias):
             return True
     return False
+
+
+def _is_supported_name_char(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0x3040 <= code <= 0x30FF
+        or 0x4E00 <= code <= 0x9FFF
+        or ch in {"ー", "・", "々", "ヶ", "ケ", "ヴ"}
+    )
+
+
+def _is_kana(ch: str) -> bool:
+    code = ord(ch)
+    return 0x3040 <= code <= 0x30FF
+
+
+def _is_cjk_term(text: str) -> bool:
+    for ch in str(text or ""):
+        code = ord(ch)
+        if 0x3040 <= code <= 0x30FF or 0x4E00 <= code <= 0x9FFF:
+            return True
+    return False
+
+
+def _looks_like_clean_name_surface(text: str) -> bool:
+    text = str(text or "").strip()
+    if not text or len(text) > 12:
+        return False
+    if not all(_is_supported_name_char(ch) for ch in text):
+        return False
+    if all(0x4E00 <= ord(ch) <= 0x9FFF for ch in text) and len(text) > 6:
+        return False
+    for honorific in ("さん", "くん", "ちゃん", "様", "先生", "先輩", "殿", "君", "氏"):
+        pos = text.find(honorific)
+        if pos >= 0 and pos + len(honorific) < len(text):
+            return False
+    return _is_name_like(text)
+
+
+def _looks_like_exportable_canonical(canonical: str, reading: str, translation: str) -> bool:
+    canonical = str(canonical or "").strip()
+    reading = str(reading or "").strip()
+    translation = str(translation or "").strip()
+    if not canonical or not _looks_like_clean_name_surface(canonical):
+        return False
+    if _is_cjk_term(canonical) and (not reading or not all(_is_kana(ch) for ch in reading)):
+        return False
+    if translation and len(translation) > 20:
+        return False
+    return True
 
 
 def _should_auto_translate_canonical(node) -> bool:
@@ -1164,6 +1223,10 @@ def _translate_alias_with_active_client(
     base_translation: str,
 ) -> str:
     if translator is None or settings is None or not hasattr(translator, "generate"):
+        return ""
+    # Default path stays heuristic-only for speed and stability.
+    # LLM alias translation is reserved for the experimental discovery workflow.
+    if not getattr(settings, "use_ollama_discovery", False):
         return ""
     model_name = _resolve_prescan_model_name(settings, translator)
     target_lang = settings.target_lang

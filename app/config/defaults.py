@@ -39,7 +39,7 @@ class AppDefaults:
     # - "dreMaz/AnimeMangaInpainting" (default, anime-focused)
     # - "runwayml/stable-diffusion-inpainting" (general, slower)
     inpaint_model: str = "dreMaz/AnimeMangaInpainting"
-    translator_backend: str = "Ollama"
+    translator_backend: str = "GGUF"
     gguf_model_path: str = ""
     gguf_prompt_style: str = "sakura"
     gguf_n_ctx: int = 4096

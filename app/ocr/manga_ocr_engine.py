@@ -41,6 +41,14 @@ def _preload_torch_dlls() -> None:
                 pass
 
 
+def ensure_torch_runtime_ready():
+    """Prepare DLL paths and import torch before OCR model init."""
+    _add_dll_search_paths()
+    _preload_torch_dlls()
+    import torch
+    return torch
+
+
 def resolve_manga_ocr_model_ref() -> str | None:
     """Resolve the best MangaOCR model reference: system cache, local path, or None."""
     return resolve_manga_ocr_system_ref() or resolve_manga_ocr_local_dir()
@@ -147,10 +155,8 @@ class MangaOcrEngine:
             return self._engine(image), 1.0
 
     def __init__(self, use_gpu: bool) -> None:
-        _add_dll_search_paths()
-        _preload_torch_dlls()
         try:
-            import torch  # noqa: F401
+            ensure_torch_runtime_ready()
         except Exception as exc:  # pragma: no cover - runtime dependency
             raise RuntimeError(f"Failed to load torch: {exc}") from exc
         self._engine = create_manga_ocr_instance(use_gpu)

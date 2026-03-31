@@ -91,6 +91,16 @@ class MangaOcrWorker:
     def recognize(self, image) -> str:
         if Image is None:
             raise RuntimeError("Pillow is not installed.")
+        if not hasattr(image, "save"):
+            try:
+                import numpy as np
+                import cv2
+                if isinstance(image, np.ndarray):
+                    if image.ndim == 3 and image.shape[2] == 3:
+                        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    image = Image.fromarray(image)
+            except Exception:
+                pass
         with self._lock:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
                 tmp_path = tmp.name
